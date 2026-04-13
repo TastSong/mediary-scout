@@ -7,6 +7,9 @@ from hashlib import sha1
 from time import time
 from typing import Any, Callable, Dict, List, Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import requests
 
 

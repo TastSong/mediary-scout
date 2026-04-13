@@ -5,6 +5,9 @@ import time
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from p115client import P115Client
 from pansou_client import BoundTransferUrl, TransferPlan
 

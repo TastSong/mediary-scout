@@ -1,5 +1,6 @@
 import {
   createEpisodeStates,
+  episodeNumberFromCode,
   reconcileVerifiedFiles,
   type AgentDecision,
   type AuditEvent,
@@ -79,10 +80,13 @@ export async function runType2Initialization(input: {
 
   await input.storage.flattenDirectory(input.season.storageDirectoryId);
   const verifiedFiles = await input.storage.listVideoFiles(input.season.storageDirectoryId);
+  const currentAiredFiles = verifiedFiles.filter(
+    (file) => episodeNumberFromCode(file.episodeCode) <= input.season.latestAiredEpisode,
+  );
   const reconciledEpisodes = reconcileVerifiedFiles({
     season: input.season,
     episodes,
-    files: verifiedFiles,
+    files: currentAiredFiles,
   });
   const obtainedEpisodes = reconciledEpisodes
     .filter((episode) => episode.obtained)

@@ -1123,6 +1123,27 @@ Postgres should be the only source of truth for durable state:
 Neon Postgres through Vercel is a reasonable first production choice because it
 fits the Next.js/Vercel deployment model and keeps database setup managed.
 
+The P1 kernel starts with a repository contract before choosing a concrete
+database adapter.
+
+That contract stores one workflow run snapshot as a coherent unit:
+
+- media title
+- tracked season
+- episode states
+- workflow run
+- resource snapshots
+- agent decisions
+- transfer attempts
+- notifications
+
+The in-memory implementation is not the production database. Its job is to make
+the persistence boundary explicit and testable. It validates references before
+mutation, returns defensive copies, and enforces that agent decisions only refer
+to candidates from persisted resource snapshots. A later SQLite or Postgres
+adapter should satisfy the same contract rather than re-implementing workflow
+rules in route handlers or UI components.
+
 Redis can be useful, but it should not become the truth store.
 
 Redis is appropriate for:

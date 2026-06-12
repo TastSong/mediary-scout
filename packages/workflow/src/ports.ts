@@ -10,6 +10,7 @@ import type { AgentNodeTraceEvent } from "./agent-node-runtime.js";
 import type {
   PackageRecognitionDecision,
   PackageRecognitionInput,
+  PackageTreeFile,
 } from "./package-normalizer.js";
 
 export interface ResourceProvider {
@@ -26,6 +27,10 @@ export interface StorageExecutor {
   }): Promise<TransferAttempt>;
   flattenDirectory(directoryId: string): Promise<{ moved: string[]; removed: string[] }>;
   deleteFiles(input: { directoryId: string; fileIds: string[] }): Promise<{ deleted: string[] }>;
+  /** Path-preserving recursive snapshot of a staging directory (all files, not just videos). */
+  listTree(input: { directoryId: string; maxDepth?: number }): Promise<PackageTreeFile[]>;
+  /** Move files (by provider file id) into a target directory inside the write scope. */
+  moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
 }
 
 export interface AcquisitionPlanningInput {

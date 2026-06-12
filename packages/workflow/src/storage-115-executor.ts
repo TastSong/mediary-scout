@@ -4,6 +4,7 @@ import type {
   TransferStatus,
   VerifiedFile,
 } from "./domain.js";
+import type { PackageTreeFile } from "./package-normalizer.js";
 import type { StorageExecutor } from "./ports.js";
 
 const DEFAULT_VIDEO_EXTENSIONS = [
@@ -367,6 +368,49 @@ export class Storage115Executor implements StorageExecutor {
     }
 
     return { moved, removed: removableDirectoryIds };
+  }
+
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<PackageTreeFile[]> {
+    const maxDepth = input.maxDepth ?? 6;
+    const results: PackageTreeFile[] = [];
+    const walk = async (directoryId: string, prefix: string, depth: number): Promise<void> => {
+      if (depth > maxDepth) {
+        return;
+      }
+      const items = await this.callApi("listItems", () => this.api.listItems({ directoryId }));
+      for (const item of items) {
+        const name = itemName(item);
+        if (isDirectory(item)) {
+          const childId = directoryIdFromItem(item);
+          if (childId) {
+            await walk(childId, `${prefix}${name}/`, depth + 1);
+          }
+          continue;
+        }
+        const providerFileId = fileIdFromItem(item);
+        if (!providerFileId) {
+          continue;
+        }
+        results.push({
+          path: `${prefix}${name}`,
+          providerFileId,
+          sizeBytes: numberValue(item.size ?? item.s),
+        });
+      }
+    };
+    await walk(normalizeDirectoryId(input.directoryId), "", 1);
+    return results;
+  }
+
+  async moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }> {
+    if (input.fileIds.length === 0) {
+      return { moved: [] };
+    }
+    const safeTargetId = await this.assertWithinWriteScope(input.targetDirectoryId, "move files into");
+    const result = await this.callApi("moveItems", () =>
+      this.api.moveItems({ fileIds: input.fileIds, targetDirectoryId: safeTargetId }),
+    );
+    return { moved: result.ok ? input.fileIds : [] };
   }
 
   async deleteFiles(input: { directoryId: string; fileIds: string[] }): Promise<{ deleted: string[] }> {

@@ -10,6 +10,7 @@ import type {
   PackageRecognitionDecision,
   PackageRecognitionInput,
 } from "./package-normalizer.js";
+import type { PackageTreeFile } from "./package-normalizer.js";
 import type {
   AcquisitionPlanningInput,
   AcquisitionPlanningResult,
@@ -17,6 +18,8 @@ import type {
   ResourceProvider,
   StorageExecutor,
 } from "./ports.js";
+
+export type FakePackageTreeFile = PackageTreeFile & { episodeCode?: string };
 
 const FIXED_CREATED_AT = "2026-01-01T00:00:00.000Z";
 
@@ -86,11 +89,20 @@ export class FakeStorageExecutor implements StorageExecutor {
   private nextDirectoryNumber = 1;
   private nextTransferNumber = 1;
 
+  private readonly packageTrees: Map<string, FakePackageTreeFile[]>;
+
   constructor(input: {
     directories?: Record<string, VerifiedFile[]>;
     transferOutcomes?: Record<string, TransferOutcome>;
     nestedDirectories?: Set<string>;
+    packageTrees?: Record<string, FakePackageTreeFile[]>;
   } = {}) {
+    this.packageTrees = new Map(
+      Object.entries(input.packageTrees ?? {}).map(([directoryId, files]) => [
+        directoryId,
+        files.map((file) => ({ ...file })),
+      ]),
+    );
     this.directories = new Map(
       Object.entries(input.directories ?? {}).map(([directoryId, files]) => [
         directoryId,
@@ -161,6 +173,39 @@ export class FakeStorageExecutor implements StorageExecutor {
       files.filter((file) => !fileIds.has(file.id)),
     );
     return { deleted };
+  }
+
+  async listTree(input: { directoryId: string; maxDepth?: number }): Promise<PackageTreeFile[]> {
+    return (this.packageTrees.get(input.directoryId) ?? []).map(
+      ({ episodeCode: _episodeCode, ...file }) => ({ ...file }),
+    );
+  }
+
+  async moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }> {
+    const wanted = new Set(input.fileIds);
+    const moved: string[] = [];
+    for (const [stagingId, treeFiles] of this.packageTrees) {
+      const keep: FakePackageTreeFile[] = [];
+      for (const treeFile of treeFiles) {
+        if (!wanted.has(treeFile.providerFileId)) {
+          keep.push(treeFile);
+          continue;
+        }
+        moved.push(treeFile.providerFileId);
+        if (treeFile.episodeCode !== undefined) {
+          this.filesFor(input.targetDirectoryId).push({
+            id: treeFile.providerFileId,
+            storageDirectoryId: input.targetDirectoryId,
+            name: treeFile.path.split("/").at(-1) ?? treeFile.path,
+            sizeBytes: treeFile.sizeBytes,
+            episodeCode: treeFile.episodeCode,
+            providerFileId: treeFile.providerFileId,
+          });
+        }
+      }
+      this.packageTrees.set(stagingId, keep);
+    }
+    return { moved };
   }
 
   private filesFor(directoryId: string): VerifiedFile[] {

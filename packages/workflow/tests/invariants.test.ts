@@ -389,3 +389,30 @@ describe("FakeAgentNodes.planAcquisition", () => {
     ).toBe(true);
   });
 });
+
+describe("FakeStorageExecutor package trees", () => {
+  it("returns the configured tree and materializes moved files for verification", async () => {
+    const storage = new FakeStorageExecutor({
+      packageTrees: {
+        staging_1: [
+          { path: "pack/S01/Show.S01E01.mkv", providerFileId: "f1", sizeBytes: 100, episodeCode: "S01E01" },
+          { path: "pack/S01/Show.S01E02.mkv", providerFileId: "f2", sizeBytes: 100, episodeCode: "S01E02" },
+          { path: "pack/doc/Making.Of.mkv", providerFileId: "f3", sizeBytes: 50 },
+        ],
+      },
+    });
+
+    const tree = await storage.listTree({ directoryId: "staging_1" });
+    expect(tree.map((file) => file.providerFileId)).toEqual(["f1", "f2", "f3"]);
+
+    const seasonDir = await storage.createDirectory({ name: "Season 1", parentId: "show_dir" });
+    const moved = await storage.moveFiles({ fileIds: ["f1", "f2"], targetDirectoryId: seasonDir });
+    expect(moved.moved).toEqual(["f1", "f2"]);
+
+    const videos = await storage.listVideoFiles(seasonDir);
+    expect(videos.map((video) => video.episodeCode).sort()).toEqual(["S01E01", "S01E02"]);
+
+    const remaining = await storage.listTree({ directoryId: "staging_1" });
+    expect(remaining.map((file) => file.providerFileId)).toEqual(["f3"]);
+  });
+});

@@ -380,6 +380,14 @@ class RecordingCandidateStorage implements StorageExecutor {
   async deleteFiles(): Promise<{ deleted: string[] }> {
     return { deleted: [] };
   }
+
+  async listTree(): Promise<never[]> {
+    return [];
+  }
+
+  async moveFiles(): Promise<{ moved: string[] }> {
+    return { moved: [] };
+  }
 }
 
 class TargetFilteringAgentNodes extends FakeAgentNodes {

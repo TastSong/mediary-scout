@@ -563,9 +563,13 @@ export function createProtectedStorage115Executor(
   if (options.apiGuard) {
     executorOptions.apiGuard = options.apiGuard;
   } else {
+    // The call budget is a lifetime backstop against runaway loops, not a
+    // per-second rate limit; pacing comes from minDelayMs. The default must
+    // accommodate a legitimate full-season batch: ~24 share receives plus
+    // recursive post-transfer verification listings.
     executorOptions.apiGuardOptions = {
-      minDelayMs: 1_200,
-      maxCallsPerOperation: 40,
+      minDelayMs: positiveIntFromEnv(env["MEDIA_TRACK_115_MIN_DELAY_MS"]) ?? 1_200,
+      maxCallsPerOperation: positiveIntFromEnv(env["MEDIA_TRACK_115_MAX_API_CALLS"]) ?? 240,
       maxListItemsPerResponse: 200,
       ...options.apiGuardOptions,
     };
@@ -594,6 +598,17 @@ function optionalExecutorOptions(
     executorOptions.videoExtensions = options.videoExtensions;
   }
   return executorOptions;
+}
+
+function positiveIntFromEnv(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`MEDIA_TRACK_115_GUARD_OPTION_INVALID: expected a positive integer, got "${value}"`);
+  }
+  return parsed;
 }
 
 function directoryIdList(value: string | undefined): string[] {

@@ -544,6 +544,41 @@ describe("Storage115Executor", () => {
     expect(api.receivedShares).toHaveLength(1);
   });
 
+  it("reads guard budget overrides from the environment", async () => {
+    const api = new FakePan115Api({
+      directories: { season_1: [] },
+      directoryInfo: {
+        season_1: seasonPathInfo("test_root", "season_1"),
+      },
+    });
+    const executor = createProtectedStorage115Executor({
+      api,
+      env: {
+        MEDIA_TRACK_115_TEST_ROOT_CID: "test_root",
+        MEDIA_TRACK_115_MAX_API_CALLS: "2",
+        MEDIA_TRACK_115_MIN_DELAY_MS: "1",
+      },
+    });
+
+    await executor.listVideoFiles("season_1");
+    await executor.listVideoFiles("season_1");
+    await expect(executor.listVideoFiles("season_1")).rejects.toThrow(
+      "maxCallsPerOperation=2",
+    );
+  });
+
+  it("rejects malformed guard budget environment values", () => {
+    expect(() =>
+      createProtectedStorage115Executor({
+        api: new FakePan115Api(),
+        env: {
+          MEDIA_TRACK_115_TEST_ROOT_CID: "test_root",
+          MEDIA_TRACK_115_MAX_API_CALLS: "many",
+        },
+      }),
+    ).toThrow("MEDIA_TRACK_115_GUARD_OPTION_INVALID");
+  });
+
   it("stops scanning when a list response is too large for the guard policy", async () => {
     const api = new FakePan115Api({
       directories: {

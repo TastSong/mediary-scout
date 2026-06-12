@@ -5,6 +5,7 @@ import {
   FakeAgentNodes,
   FakeResourceProvider,
   FakeStorageExecutor,
+  importForeignWorkAsMovie,
   InMemoryWorkflowRepository,
   queueTrackingInitialization,
   requestTrackingInitialization,
@@ -411,3 +412,43 @@ function verifiedFile(season: TrackedSeason, id: string, code: string): Verified
     providerFileId: `provider_${id}`,
   };
 }
+
+describe("importForeignWorkAsMovie", () => {
+  it("moves user-confirmed foreign files into a canonical movie directory and renames a single video", async () => {
+    const storage = new FakeStorageExecutor({
+      unparsedFiles: {
+        staging_pack: [
+          { providerFileId: "el_camino", name: "El.Camino.2019.2160p.mkv", sizeBytes: 30_000_000_000 },
+        ],
+      },
+    });
+
+    const result = await importForeignWorkAsMovie({
+      storage,
+      providerFileIds: ["el_camino"],
+      movieTitle: "续命之徒：绝命毒师电影",
+      year: 2019,
+      moviesParentDirectoryId: "movies_root",
+    });
+
+    expect(result.movedFileIds).toEqual(["el_camino"]);
+    expect(result.renamedTo).toBe("续命之徒：绝命毒师电影 (2019).mkv");
+    // the canonical rename makes the file a verified (parseable-name) movie file
+    const stagingLeft = await storage.listUnparsedVideoFiles("staging_pack");
+    expect(stagingLeft).toEqual([]);
+    const landedUnparsed = await storage.listUnparsedVideoFiles(result.movieDirectoryId);
+    expect(landedUnparsed.map((file) => file.name)).toEqual(["续命之徒：绝命毒师电影 (2019).mkv"]);
+  });
+
+  it("throws when no files were given", async () => {
+    await expect(
+      importForeignWorkAsMovie({
+        storage: new FakeStorageExecutor(),
+        providerFileIds: [],
+        movieTitle: "Movie",
+        year: 2020,
+        moviesParentDirectoryId: "movies_root",
+      }),
+    ).rejects.toThrow("FOREIGN_WORK_IMPORT_EMPTY");
+  });
+});

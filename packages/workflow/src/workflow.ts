@@ -189,7 +189,15 @@ export async function runType2Initialization(input: {
     transferAttempts: outcome.transferAttempts,
     decisions: outcome.decisions,
     notification,
-    notifications: [notification],
+    notifications: [
+      notification,
+      ...foreignWorkNotificationsFromAudit({
+        workflowRunId,
+        titleName: input.title.title,
+        auditEvents,
+        now,
+      }),
+    ],
     auditEvents,
   };
 }
@@ -381,7 +389,15 @@ export async function runType3Monitoring(input: {
     transferAttempts: outcome.transferAttempts,
     decisions: outcome.decisions,
     notification,
-    notifications: [notification],
+    notifications: [
+      notification,
+      ...foreignWorkNotificationsFromAudit({
+        workflowRunId,
+        titleName: input.title.title,
+        auditEvents,
+        now,
+      }),
+    ],
     auditEvents,
   };
 }
@@ -574,7 +590,15 @@ export async function runSeriesInitialization(input: {
     transferAttempts: outcome.transferAttempts,
     decisions: outcome.decisions,
     notification,
-    notifications: [notification],
+    notifications: [
+      notification,
+      ...foreignWorkNotificationsFromAudit({
+        workflowRunId,
+        titleName: input.title.title,
+        auditEvents,
+        now,
+      }),
+    ],
     auditEvents,
   };
 }
@@ -777,6 +801,13 @@ async function normalizeStagingDirectory(input: {
       data: { stagingDirectoryId: input.stagingDirectoryId, rejectedFiles: plan.rejectedFiles },
     });
   }
+  if (plan.foreignWorkFiles.length > 0) {
+    input.auditEvents.push({
+      type: "foreign_work_detected",
+      message: `${plan.foreignWorkFiles.length} files in staging ${input.stagingDirectoryId} may belong to a different title; awaiting user confirmation`,
+      data: { stagingDirectoryId: input.stagingDirectoryId, files: plan.foreignWorkFiles },
+    });
+  }
 
   const inScope = new Set(input.seasons.map((season) => season.seasonNumber));
   const actionsBySeason = new Map<number, PackageMoveAction[]>();
@@ -852,6 +883,36 @@ async function normalizeStagingDirectory(input: {
       });
     }
   }
+}
+
+/**
+ * Foreign-work findings become first-class feed entries: the user must see
+ * "this pack carried what looks like a different title" without digging
+ * through audit logs, because the next step (import it as its own movie) is
+ * a user decision the workflow must never make on its own.
+ */
+export function foreignWorkNotificationsFromAudit(input: {
+  workflowRunId: string;
+  titleName: string;
+  auditEvents: AuditEvent[];
+  now: () => string;
+}): NotificationEvent[] {
+  return input.auditEvents
+    .filter((event) => event.type === "foreign_work_detected")
+    .map((event, index) => {
+      const files =
+        (event.data as { files?: Array<{ sourcePath: string }> } | undefined)?.files ?? [];
+      return {
+        id: `notification_${input.workflowRunId}_foreign_${index + 1}`,
+        workflowRunId: input.workflowRunId,
+        kind: "foreign_work_detected",
+        title: `${input.titleName} 资源包内发现疑似其他作品`,
+        body: `${files.length} 个文件已隔离在 staging，待确认是否单独入库：${files
+          .map((file) => file.sourcePath)
+          .join("、")}`,
+        createdAt: input.now(),
+      };
+    });
 }
 
 /**

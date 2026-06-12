@@ -183,4 +183,10 @@ function file(path: string) {
     expect(plan.actions).toHaveLength(1);
     expect(plan.warnings.some((warning) => warning.includes("可能属于其他作品"))).toBe(true);
     expect(plan.warnings.some((warning) => warning.includes("El.Camino"))).toBe(true);
+    expect(plan.foreignWorkFiles).toEqual([
+      {
+        providerFileId: "pack/续命之徒：绝命毒师电影/El.Camino.2019.mkv",
+        sourcePath: "pack/续命之徒：绝命毒师电影/El.Camino.2019.mkv",
+      },
+    ]);
   });

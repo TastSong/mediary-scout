@@ -264,6 +264,23 @@ export class FakeStorageExecutor implements StorageExecutor {
         moved.push(file.id);
       }
     }
+    for (const [directoryId, files] of this.unparsedFiles) {
+      if (directoryId === input.targetDirectoryId) {
+        continue;
+      }
+      const moving = files.filter((file) => wanted.has(file.providerFileId));
+      if (moving.length === 0) {
+        continue;
+      }
+      this.unparsedFiles.set(
+        directoryId,
+        files.filter((file) => !wanted.has(file.providerFileId)),
+      );
+      const target = this.unparsedFiles.get(input.targetDirectoryId) ?? [];
+      target.push(...moving);
+      this.unparsedFiles.set(input.targetDirectoryId, target);
+      moved.push(...moving.map((file) => file.providerFileId));
+    }
     for (const [stagingId, treeFiles] of this.packageTrees) {
       const keep: FakePackageTreeFile[] = [];
       for (const treeFile of treeFiles) {

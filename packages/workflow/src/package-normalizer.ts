@@ -44,11 +44,18 @@ export interface PackageRejectedFile {
   message: string;
 }
 
+export interface PackageForeignWorkFile {
+  providerFileId: string;
+  sourcePath: string;
+}
+
 export interface PackageNormalizationPlan {
   coverage: PackageCoverage;
   confidence: Confidence;
   actions: PackageMoveAction[];
   rejectedFiles: PackageRejectedFile[];
+  /** Files the recognition agent judged to belong to a DIFFERENT title; quarantined for user-confirmed import. */
+  foreignWorkFiles: PackageForeignWorkFile[];
   warnings: string[];
 }
 
@@ -144,11 +151,16 @@ export async function buildAgentAssistedPackageNormalizationPlan(
     ...input,
     recognitionMappings: decision.fileMappings,
   });
-  const foreignWarnings = (decision.foreignWorkProviderFileIds ?? []).map(
-    (providerFileId) => `文件可能属于其他作品（建议人工确认是否单独入库）: ${providerFileId}`,
+  const pathByProviderFileId = new Map(input.files.map((file) => [file.providerFileId, file.path]));
+  const foreignWorkFiles = (decision.foreignWorkProviderFileIds ?? []).map((providerFileId) => ({
+    providerFileId,
+    sourcePath: pathByProviderFileId.get(providerFileId) ?? providerFileId,
+  }));
+  const foreignWarnings = foreignWorkFiles.map(
+    (file) => `文件可能属于其他作品（建议人工确认是否单独入库）: ${file.sourcePath}`,
   );
-  return foreignWarnings.length > 0
-    ? { ...assisted, warnings: [...assisted.warnings, ...foreignWarnings] }
+  return foreignWorkFiles.length > 0
+    ? { ...assisted, foreignWorkFiles, warnings: [...assisted.warnings, ...foreignWarnings] }
     : assisted;
 }
 
@@ -177,6 +189,7 @@ export function buildPackageNormalizationPlan(input: PackageNormalizationInput):
           .map((file) => rejectedFile(file, "duplicate_episode")),
         ...incompleteFiles.map((file) => rejectedFile(file, missingReason(file))),
       ],
+      foreignWorkFiles: [],
       warnings: ["duplicate episode mappings require a safer choice before package normalization"],
     };
   }
@@ -204,6 +217,7 @@ export function buildPackageNormalizationPlan(input: PackageNormalizationInput):
     confidence: rejectedFiles.length > 0 ? "low" : planConfidence(actions, rejectedFiles),
     actions,
     rejectedFiles,
+    foreignWorkFiles: [],
     warnings: rejectedFiles.length > 0 ? ["some video files could not be mapped to season/episode identity"] : [],
   };
 }

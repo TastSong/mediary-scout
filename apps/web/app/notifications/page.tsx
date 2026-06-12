@@ -1,6 +1,7 @@
+import Link from "next/link";
 import { connection } from "next/server";
 import { Suspense } from "react";
-import { Bell, CheckCircle2, CircleSlash, DownloadCloud, Layers, ShieldCheck } from "lucide-react";
+import { Bell, CheckCircle2, CircleSlash, DownloadCloud, Film, Layers, ShieldCheck } from "lucide-react";
 import type { NotificationEvent } from "@media-track/workflow";
 import { AppSidebar } from "../../components/app-sidebar";
 import { ensureDemoSeeded, getWorkflowRepository } from "../../lib/workflow-runtime";
@@ -12,6 +13,7 @@ const kindMeta: Record<string, { label: string; tone: string; icon: typeof Bell 
   episodes_restored: { label: "缺集修复", tone: "blue", icon: DownloadCloud },
   already_current: { label: "已是最新", tone: "muted", icon: ShieldCheck },
   no_coverage: { label: "暂无资源", tone: "amber", icon: CircleSlash },
+  foreign_work_detected: { label: "待确认入库", tone: "amber", icon: Film },
 };
 
 export default function NotificationsPage() {
@@ -75,6 +77,14 @@ async function NotificationFeed() {
                       <span className={`feed-badge tone-${meta.tone}`}>{meta.label}</span>
                     </span>
                     <span className="feed-text">{item.body}</span>
+                    {item.kind === "foreign_work_detected" ? (
+                      <Link
+                        className="feed-action"
+                        href={`/foreign-work/${encodeURIComponent(item.workflowRunId)}`}
+                      >
+                        去处理 →
+                      </Link>
+                    ) : null}
                   </span>
                   <time className="feed-time" dateTime={item.createdAt}>
                     {timeLabel(item.createdAt)}

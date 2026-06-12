@@ -9,6 +9,7 @@ import {
   FakeStorageExecutor,
   createXiaomiMimoAgentNodesFromEnv,
   getTrackedSeasonStatusView,
+  importForeignWorkAsMovie,
   assertWorkflowAgentAdapterPolicy,
   prepareSeriesTarget,
   prepareTrackingTarget,
@@ -387,4 +388,51 @@ function defaultQuality(): string {
 
 function webDatabasePath(): string {
   return process.env.MEDIA_TRACK_WEB_DB_PATH ?? ".media-track-web.sqlite";
+}
+
+export interface ForeignWorkFinding {
+  stagingDirectoryId: string;
+  files: Array<{ providerFileId: string; sourcePath: string }>;
+}
+
+export interface ForeignWorkReview {
+  workflowRunId: string;
+  titleName: string;
+  findings: ForeignWorkFinding[];
+}
+
+/** Foreign-work findings recorded by a run, for the user-confirmation page. */
+export async function getForeignWorkReview(workflowRunId: string): Promise<ForeignWorkReview | null> {
+  const repository = getWorkflowRepository();
+  const snapshot = await repository.getWorkflowRunSnapshot(workflowRunId);
+  if (!snapshot) {
+    return null;
+  }
+  const findings = snapshot.workflowRun.auditEvents
+    .filter((event) => event.type === "foreign_work_detected")
+    .map((event) => event.data as unknown as ForeignWorkFinding)
+    .filter((finding) => Array.isArray(finding?.files) && finding.files.length > 0);
+  return { workflowRunId, titleName: snapshot.title.title, findings };
+}
+
+export async function importForeignWorkFiles(input: {
+  providerFileIds: string[];
+  movieTitle: string;
+  year: number;
+}): Promise<{ movieDirectoryId: string; movedFileIds: string[]; renamedTo: string | null }> {
+  return importForeignWorkAsMovie({
+    storage: getWorkerStorageExecutor(),
+    providerFileIds: input.providerFileIds,
+    movieTitle: input.movieTitle,
+    year: input.year,
+    moviesParentDirectoryId: moviesParentDirectoryId(),
+  });
+}
+
+function moviesParentDirectoryId(): string {
+  return (
+    process.env.MEDIA_TRACK_MOVIES_PARENT_CID ??
+    process.env.MEDIA_TRACK_115_TEST_ROOT_CID ??
+    "fake_movies_root"
+  );
 }

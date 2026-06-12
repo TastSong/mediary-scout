@@ -76,3 +76,38 @@ export async function requestSeriesAction(input: {
   revalidatePath("/");
   return { status: "requested", message: "全剧获取已加入后台队列。" };
 }
+
+export interface ForeignWorkImportActionResult {
+  status: "imported" | "failed";
+  message: string;
+}
+
+export async function importForeignWorkAction(input: {
+  providerFileIds: string[];
+  movieTitle: string;
+  year: number;
+}): Promise<ForeignWorkImportActionResult> {
+  const movieTitle = input.movieTitle.trim();
+  const year = Number(input.year);
+  if (!movieTitle || !Number.isInteger(year) || year < 1880 || year > 2100) {
+    return { status: "failed", message: "请填写有效的电影名称与年份。" };
+  }
+  if (input.providerFileIds.length === 0) {
+    return { status: "failed", message: "没有可入库的文件。" };
+  }
+  try {
+    const { importForeignWorkFiles } = await import("../lib/workflow-runtime");
+    const result = await importForeignWorkFiles({
+      providerFileIds: input.providerFileIds,
+      movieTitle,
+      year,
+    });
+    revalidatePath("/notifications");
+    return {
+      status: "imported",
+      message: `已入库到 ${movieTitle} (${year})${result.renamedTo ? `，并重命名为 ${result.renamedTo}` : ""}。`,
+    };
+  } catch (error) {
+    return { status: "failed", message: `入库失败：${String(error)}` };
+  }
+}

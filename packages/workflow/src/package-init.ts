@@ -15,8 +15,11 @@ import {
 } from "./package-normalizer.js";
 import type { AgentNodes, StorageExecutor } from "./ports.js";
 import type { WorkflowRepository } from "./repository.js";
+import { foreignWorkNotificationsFromAudit } from "./workflow.js";
 
-const FIXED_CREATED_AT = "2026-01-01T00:00:00.000Z";
+function defaultNowIso(): string {
+  return new Date().toISOString();
+}
 
 export interface SeasonMetadataInput {
   seasonNumber: number;
@@ -36,6 +39,7 @@ export interface SeriesPackageInitializationResult {
   rejectedFiles: PackageRejectedFile[];
   warnings: string[];
   notification: NotificationEvent;
+  notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
 }
 
@@ -59,8 +63,10 @@ export async function runSeriesPackageInitialization(input: {
   agents: AgentNodes;
   qualityPreference?: string;
   workflowRunId?: string;
+  now?: () => string;
 }): Promise<SeriesPackageInitializationResult> {
   const workflowRunId = input.workflowRunId ?? "run_package_init";
+  const now = input.now ?? defaultNowIso;
   const auditEvents: AuditEvent[] = [];
   const qualityPreference = input.qualityPreference ?? "4K";
 
@@ -83,6 +89,13 @@ export async function runSeriesPackageInitialization(input: {
       warnings: plan.warnings,
     },
   });
+  if (plan.foreignWorkFiles.length > 0) {
+    auditEvents.push({
+      type: "foreign_work_detected",
+      message: `${plan.foreignWorkFiles.length} files in staging ${input.stagingDirectoryId} may belong to a different title; awaiting user confirmation`,
+      data: { stagingDirectoryId: input.stagingDirectoryId, files: plan.foreignWorkFiles },
+    });
+  }
 
   const actionsBySeason = new Map<number, PackageMoveAction[]>();
   for (const action of plan.actions) {
@@ -171,7 +184,7 @@ export async function runSeriesPackageInitialization(input: {
     kind: status === "no_coverage" ? "no_coverage" : "package_initialized",
     title: `${input.title.title} ${status === "no_coverage" ? "package not normalized" : "package initialized"}`,
     body: `${totalObtained} episodes obtained across ${seasonResults.length} seasons; ${plan.rejectedFiles.length} files left in staging`,
-    createdAt: FIXED_CREATED_AT,
+    createdAt: now(),
   };
 
   return {
@@ -180,6 +193,15 @@ export async function runSeriesPackageInitialization(input: {
     rejectedFiles: plan.rejectedFiles,
     warnings: plan.warnings,
     notification,
+    notifications: [
+      notification,
+      ...foreignWorkNotificationsFromAudit({
+        workflowRunId,
+        titleName: input.title.title,
+        auditEvents,
+        now,
+      }),
+    ],
     auditEvents,
   };
 }
@@ -194,6 +216,7 @@ export async function runSeriesPackageInitializationAndPersist(input: {
   repository: WorkflowRepository;
   workflowRun: { id: string; startedAt: string; finishedAt: string | null };
   qualityPreference?: string;
+  now?: () => string;
 }): Promise<SeriesPackageInitializationResult> {
   const result = await runSeriesPackageInitialization({
     title: input.title,
@@ -204,9 +227,10 @@ export async function runSeriesPackageInitializationAndPersist(input: {
     agents: input.agents,
     workflowRunId: input.workflowRun.id,
     ...(input.qualityPreference === undefined ? {} : { qualityPreference: input.qualityPreference }),
+    ...(input.now === undefined ? {} : { now: input.now }),
   });
 
-  for (const seasonResult of result.seasons) {
+  for (const [index, seasonResult] of result.seasons.entries()) {
     const seasonRunId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
     await input.repository.saveWorkflowRunSnapshot({
       title: input.title,
@@ -224,13 +248,15 @@ export async function runSeriesPackageInitializationAndPersist(input: {
       resourceSnapshots: [],
       decisions: [],
       transferAttempts: [],
-      notifications: [
-        {
-          ...result.notification,
-          id: `notification_${seasonRunId}`,
-          workflowRunId: seasonRunId,
-        },
-      ],
+      // Title-level notifications ride on the first season record only.
+      notifications:
+        index === 0
+          ? result.notifications.map((notification) => ({
+              ...notification,
+              id: notification.id.replace(input.workflowRun.id, seasonRunId),
+              workflowRunId: seasonRunId,
+            }))
+          : [],
     });
   }
 

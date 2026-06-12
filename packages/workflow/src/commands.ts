@@ -432,3 +432,70 @@ export async function queueSeriesInitialization(input: {
   }
   return { status: "queued", titleId: input.title.id, workflowRunId };
 }
+
+export interface ForeignWorkImportResult {
+  movieDirectoryId: string;
+  movedFileIds: string[];
+  renamedTo: string | null;
+}
+
+/**
+ * User-confirmed import of foreign-work files quarantined in staging. The
+ * recognition agent only FLAGS a file as belonging to a different title;
+ * naming the destination and pulling the trigger is the user's decision.
+ * Deterministic execution: find-or-create `Title (Year)` under the movies
+ * parent, move the files, and when exactly one video landed rename it to
+ * the canonical movie filename so library scrapers can identify it.
+ */
+export async function importForeignWorkAsMovie(input: {
+  storage: StorageExecutor;
+  providerFileIds: string[];
+  movieTitle: string;
+  year: number;
+  moviesParentDirectoryId: string;
+}): Promise<ForeignWorkImportResult> {
+  if (input.providerFileIds.length === 0) {
+    throw new Error("FOREIGN_WORK_IMPORT_EMPTY: no files to import");
+  }
+  const movieName = `${input.movieTitle} (${input.year})`;
+  const movieDirectoryId = await input.storage.createDirectory({
+    name: movieName,
+    parentId: input.moviesParentDirectoryId,
+  });
+  const { moved } = await input.storage.moveFiles({
+    fileIds: input.providerFileIds,
+    targetDirectoryId: movieDirectoryId,
+  });
+  if (moved.length === 0) {
+    throw new Error("FOREIGN_WORK_IMPORT_NOTHING_MOVED: none of the requested files could be moved");
+  }
+
+  let renamedTo: string | null = null;
+  if (moved.length === 1) {
+    const movedId = moved[0]!;
+    const landed = [
+      ...(await input.storage.listUnparsedVideoFiles(movieDirectoryId)).map((file) => ({
+        id: file.providerFileId,
+        name: file.name,
+      })),
+      ...(await input.storage.listVideoFiles(movieDirectoryId)).map((file) => ({
+        id: file.id,
+        name: file.name,
+      })),
+    ].find((file) => file.id === movedId);
+    if (landed !== undefined) {
+      const extensionMatch = /\.[A-Za-z0-9]+$/.exec(landed.name);
+      const newName = `${movieName}${extensionMatch?.[0] ?? ""}`;
+      if (newName !== landed.name) {
+        await input.storage.renameFile({
+          directoryId: movieDirectoryId,
+          fileId: movedId,
+          newName,
+        });
+        renamedTo = newName;
+      }
+    }
+  }
+
+  return { movieDirectoryId, movedFileIds: moved, renamedTo };
+}

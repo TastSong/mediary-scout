@@ -7,7 +7,9 @@ import {
   FakeAgentNodes,
   FakeResourceProvider,
   FakeStorageExecutor,
+  createNotifyChannelsFromEnv,
   createXiaomiMimoAgentNodesFromEnv,
+  dispatchNotifications,
   getTrackedSeasonStatusView,
   importForeignWorkAsMovie,
   assertWorkflowAgentAdapterPolicy,
@@ -115,6 +117,7 @@ export async function queueCandidateTracking(candidateId: string): Promise<Candi
 
 export async function runNextQueuedWorkflow() {
   const repository = getWorkflowRepository();
+  const startedAt = new Date().toISOString();
   const type2 = await runQueuedType2Workflow({
     repository,
     resourceProvider: getWorkerResourceProvider(),
@@ -123,15 +126,51 @@ export async function runNextQueuedWorkflow() {
     storageParentDirectoryId: storageParentDirectoryId(),
   });
   if (type2.status !== "idle") {
+    await pushNotificationsSince(repository, startedAt);
     return type2;
   }
-  return runQueuedSeriesInitialization({
+  const series = await runQueuedSeriesInitialization({
     repository,
     resourceProvider: getWorkerResourceProvider(),
     storage: getWorkerStorageExecutor(),
     agents: getAgentNodes(),
     storageParentDirectoryId: storageParentDirectoryId(),
   });
+  if (series.status !== "idle") {
+    await pushNotificationsSince(repository, startedAt);
+  }
+  return series;
+}
+
+/**
+ * Outbound push rides on the feed: whatever notifications a run persisted
+ * are delivered to every user-configured channel. Delivery failures are
+ * logged, never thrown — the run already succeeded.
+ */
+async function pushNotificationsSince(
+  targetRepository: WorkflowRepository,
+  sinceIso: string,
+): Promise<void> {
+  const channels = createNotifyChannelsFromEnv();
+  if (channels.length === 0) {
+    return;
+  }
+  try {
+    const recent = (await targetRepository.listNotifications({ limit: 20 })).filter(
+      (notification) => notification.createdAt >= sinceIso,
+    );
+    if (recent.length === 0) {
+      return;
+    }
+    const result = await dispatchNotifications({ channels, notifications: recent });
+    for (const failure of result.failures) {
+      console.error(
+        `[media-track] push via ${failure.channelId} failed for ${failure.notificationId}: ${failure.error}`,
+      );
+    }
+  } catch (error) {
+    console.error(`[media-track] notification push failed: ${String(error)}`);
+  }
 }
 
 export async function queueCandidateSeries(candidateId: string): Promise<CandidateTrackingRequestResult> {
@@ -190,7 +229,8 @@ export async function queueCandidateSeries(candidateId: string): Promise<Candida
 
 export async function runScheduledType3() {
   const repository = getWorkflowRepository();
-  return runScheduledType3Monitoring({
+  const startedAt = new Date().toISOString();
+  const result = await runScheduledType3Monitoring({
     repository,
     resourceProvider: getWorkerResourceProvider(),
     storage: getWorkerStorageExecutor(),
@@ -198,6 +238,8 @@ export async function runScheduledType3() {
     storageParentDirectoryId: storageParentDirectoryId(),
     staleActiveRunTimeoutMs: 30 * 60 * 1000,
   });
+  await pushNotificationsSince(repository, startedAt);
+  return result;
 }
 
 async function seedDemoIfEmpty(targetRepository: WorkflowRepository): Promise<void> {

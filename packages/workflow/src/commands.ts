@@ -48,6 +48,7 @@ export interface TrackingFromTmdbSelectionInput {
   repository: WorkflowRepository;
   createWorkflowRunId?: () => string;
   now?: () => string;
+  staleActiveRunTimeoutMs?: number;
 }
 
 export interface TrackingFromTmdbSelectionResult extends PreparedTrackingTarget {
@@ -76,6 +77,9 @@ export async function requestTrackingFromTmdbSelection(
     repository: input.repository,
     ...(input.createWorkflowRunId ? { createWorkflowRunId: input.createWorkflowRunId } : {}),
     ...(input.now ? { now: input.now } : {}),
+    ...(input.staleActiveRunTimeoutMs !== undefined
+      ? { staleActiveRunTimeoutMs: input.staleActiveRunTimeoutMs }
+      : {}),
   };
   const request = await requestTrackingInitialization(requestInput);
 
@@ -95,10 +99,12 @@ export async function requestTrackingInitialization(input: {
   repository: WorkflowRepository;
   createWorkflowRunId?: () => string;
   now?: () => string;
+  staleActiveRunTimeoutMs?: number;
 }): Promise<TrackingInitializationRequestResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
   const startedAt = now();
+  const staleActiveRunStartedBefore = staleStartedBefore(startedAt, input.staleActiveRunTimeoutMs);
   const initialEpisodes = createEpisodeStates({
     trackedSeasonId: input.season.id,
     seasonNumber: input.season.seasonNumber,
@@ -129,6 +135,12 @@ export async function requestTrackingInitialization(input: {
     transferAttempts: [],
     notifications: [],
     blockIfEpisodeStatesExist: true,
+    ...(staleActiveRunStartedBefore
+      ? {
+          staleActiveRunStartedBefore,
+          staleFinishedAt: startedAt,
+        }
+      : {}),
   });
   if (reservation.status === "already_active") {
     return {
@@ -208,6 +220,20 @@ export async function requestTrackingInitialization(input: {
     });
     throw error;
   }
+}
+
+function staleStartedBefore(nowIso: string, timeoutMs: number | undefined): string | null {
+  if (timeoutMs === undefined) {
+    return null;
+  }
+  if (timeoutMs <= 0) {
+    throw new Error("staleActiveRunTimeoutMs must be positive");
+  }
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) {
+    throw new Error(`now() must return an ISO timestamp when stale recovery is enabled: ${nowIso}`);
+  }
+  return new Date(nowMs - timeoutMs).toISOString();
 }
 
 function summarizeEpisodeProgress(season: TrackedSeason, episodes: EpisodeState[]): EpisodeProgressSummary {

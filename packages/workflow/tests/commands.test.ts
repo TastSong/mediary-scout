@@ -63,6 +63,69 @@ describe("requestTrackingInitialization", () => {
     await expect(repository.getWorkflowRunSnapshot("run_should_not_be_created")).resolves.toBeNull();
   });
 
+  it("expires stale active workflow runs and starts a replacement request", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await repository.saveWorkflowRunSnapshot({
+      title,
+      season,
+      workflowRun: workflowRun(season, {
+        id: "run_stale",
+        status: "running",
+        startedAt: "2026-06-10T23:00:00.000Z",
+        finishedAt: null,
+      }),
+      episodes: episodeStates(season),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    const result = await requestTrackingInitialization({
+      title,
+      season,
+      keyword: "Show 4K",
+      resourceProvider: new FakeResourceProvider({
+        keywordResults: {
+          "Show 4K": [{ title: "Show S01E01 4K", episodeHints: ["S01E01"] }],
+        },
+      }),
+      storage: new FakeStorageExecutor({
+        directories: { [season.storageDirectoryId]: [] },
+        transferOutcomes: {
+          snapshot_1_candidate_1: {
+            status: "succeeded",
+            providerMessage: "",
+            files: [verifiedFile(season, "replacement_S01E01", "S01E01")],
+          },
+        },
+      }),
+      agents: new FakeAgentNodes(),
+      repository,
+      createWorkflowRunId: () => "run_replacement_type2",
+      now: fixedNow,
+      staleActiveRunTimeoutMs: 30 * 60 * 1000,
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      workflowRunId: "run_replacement_type2",
+      progress: {
+        obtainedEpisodes: ["S01E01"],
+      },
+    });
+    await expect(repository.getWorkflowRunSnapshot("run_stale")).resolves.toMatchObject({
+      workflowRun: {
+        status: "failed",
+        auditEvents: [
+          { type: "workflow_expired" },
+        ],
+      },
+      episodes: [],
+    });
+  });
+
   it("returns already tracked state without triggering a new workflow", async () => {
     const repository = new InMemoryWorkflowRepository();
     const { title, season } = trackedFixture();

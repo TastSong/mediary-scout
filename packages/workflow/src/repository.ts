@@ -35,6 +35,8 @@ export interface TrackedSeasonState {
 
 export interface ReserveWorkflowRunInput extends PersistWorkflowRunSnapshotInput {
   blockIfEpisodeStatesExist?: boolean;
+  staleActiveRunStartedBefore?: string;
+  staleFinishedAt?: string;
 }
 
 export type WorkflowRunReservationResult =
@@ -78,6 +80,7 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async reserveWorkflowRun(input: ReserveWorkflowRunInput): Promise<WorkflowRunReservationResult> {
     const snapshot = workflowSnapshotFromReservation(input);
     validateWorkflowRunSnapshot(snapshot);
+    this.expireStaleActiveWorkflowRuns(input);
 
     const activeRun = await this.findActiveWorkflowRun({
       trackedSeasonId: snapshot.season.id,
@@ -150,6 +153,33 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
 
   async listEpisodeStates(trackedSeasonId: string): Promise<EpisodeState[]> {
     return cloneWorkflowValue(this.episodesBySeason.get(trackedSeasonId) ?? []);
+  }
+
+  private expireStaleActiveWorkflowRuns(input: ReserveWorkflowRunInput): void {
+    if (!input.staleActiveRunStartedBefore) {
+      return;
+    }
+    const reservationSnapshot = workflowSnapshotFromReservation(input);
+    const staleRuns = Array.from(this.workflowRuns.values()).filter(
+      (stored) =>
+        stored.workflowRun.trackedSeasonId === reservationSnapshot.season.id &&
+        stored.workflowRun.kind === reservationSnapshot.workflowRun.kind &&
+        isActiveWorkflowStatus(stored.workflowRun.status) &&
+        stored.workflowRun.startedAt < input.staleActiveRunStartedBefore!,
+    );
+
+    for (const staleRun of staleRuns) {
+      const expired = cloneWorkflowValue({
+        ...staleRun,
+        workflowRun: expireWorkflowRun(
+          staleRun.workflowRun,
+          input.staleFinishedAt ?? reservationSnapshot.workflowRun.startedAt,
+        ),
+        episodes: [],
+      });
+      this.workflowRuns.set(expired.workflowRun.id, expired);
+      this.episodesBySeason.set(expired.season.id, []);
+    }
   }
 }
 
@@ -238,6 +268,26 @@ export function isActiveWorkflowStatus(status: WorkflowStatus): boolean {
 }
 
 export function workflowSnapshotFromReservation(input: ReserveWorkflowRunInput): PersistWorkflowRunSnapshotInput {
-  const { blockIfEpisodeStatesExist: _blockIfEpisodeStatesExist, ...snapshot } = input;
+  const {
+    blockIfEpisodeStatesExist: _blockIfEpisodeStatesExist,
+    staleActiveRunStartedBefore: _staleActiveRunStartedBefore,
+    staleFinishedAt: _staleFinishedAt,
+    ...snapshot
+  } = input;
   return snapshot;
+}
+
+export function expireWorkflowRun(workflowRun: WorkflowRun, finishedAt: string): WorkflowRun {
+  return {
+    ...workflowRun,
+    status: "failed",
+    finishedAt,
+    auditEvents: [
+      ...workflowRun.auditEvents,
+      {
+        type: "workflow_expired",
+        message: `Expired stale active workflow run ${workflowRun.id}`,
+      },
+    ],
+  };
 }

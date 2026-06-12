@@ -1222,10 +1222,15 @@ TMDB tv id, season number, quality preference, storage directory id, and server
 adapters. They should not hand-build `MediaTitle` or `TrackedSeason`, and they
 should not call PanSou or agent nodes directly.
 
-The next hardening step is stale-run recovery. If a worker crashes after
-reservation and before marking the run failed or succeeded, the active workflow
-can otherwise block future requests forever. Production storage should add a
-lease, heartbeat, or explicit stale-timeout recovery path.
+The command/repository boundary now supports stale-run recovery. If a worker
+crashes after reservation and before marking the run failed or succeeded, a
+later request can pass a stale timeout. The repository expires matching active
+runs during reservation, records a `workflow_expired` audit event, marks the old
+run failed, and allows the replacement run to reserve the workflow.
+
+This is still a timeout-based recovery path, not a full lease/heartbeat system.
+Production Postgres should keep the same behavior and can later add heartbeat
+updates for more precise worker liveness.
 
 The first concrete adapter can be SQLite.
 

@@ -317,6 +317,64 @@ describe("InMemoryWorkflowRepository", () => {
       workflowRun: { status: "running" },
     });
   });
+
+  it("expires stale active workflow runs during reservation", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const stale = workflowPersistenceFixture({
+      workflowRun: {
+        ...workflowPersistenceFixture().workflowRun,
+        id: "run_stale",
+        status: "running",
+        startedAt: "2026-06-11T00:00:00.000Z",
+        finishedAt: null,
+      },
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    const competing = workflowPersistenceFixture({
+      workflowRun: {
+        ...workflowPersistenceFixture().workflowRun,
+        id: "run_competing",
+        status: "running",
+        startedAt: "2026-06-11T01:00:00.000Z",
+        finishedAt: null,
+      },
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    await repository.saveWorkflowRunSnapshot(stale);
+
+    await expect(
+      repository.reserveWorkflowRun({
+        ...competing,
+        blockIfEpisodeStatesExist: true,
+        staleActiveRunStartedBefore: "2026-06-11T00:30:00.000Z",
+        staleFinishedAt: "2026-06-11T01:00:00.000Z",
+      }),
+    ).resolves.toMatchObject({
+      status: "reserved",
+      snapshot: {
+        workflowRun: { id: "run_competing" },
+      },
+    });
+
+    await expect(repository.getWorkflowRunSnapshot("run_stale")).resolves.toMatchObject({
+      workflowRun: {
+        status: "failed",
+        finishedAt: "2026-06-11T01:00:00.000Z",
+        auditEvents: [
+          { type: "resource_snapshot_created" },
+          { type: "workflow_expired" },
+        ],
+      },
+      episodes: [],
+    });
+  });
 });
 
 function workflowPersistenceFixture(

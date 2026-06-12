@@ -13,6 +13,7 @@ import {
 } from "./domain.js";
 import {
   cloneWorkflowValue,
+  expireWorkflowRun,
   isActiveWorkflowStatus,
   type PersistedWorkflowRunSnapshot,
   type PersistWorkflowRunSnapshotInput,
@@ -119,6 +120,8 @@ export class SQLiteWorkflowRepository implements WorkflowRepository {
     let committed = false;
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.expireStaleActiveWorkflowRuns(input);
+
       const activeRun = this.selectWorkflowRuns(snapshot.season.id)
         .filter(
           (workflowRun) =>
@@ -287,6 +290,24 @@ export class SQLiteWorkflowRepository implements WorkflowRepository {
     this.insertAgentDecisions(snapshot.workflowRun.id, snapshot.decisions);
     this.insertTransferAttempts(snapshot.workflowRun.id, snapshot.transferAttempts);
     this.insertNotifications(snapshot.workflowRun.id, snapshot.notifications);
+  }
+
+  private expireStaleActiveWorkflowRuns(input: ReserveWorkflowRunInput): void {
+    if (!input.staleActiveRunStartedBefore) {
+      return;
+    }
+    const snapshot = workflowSnapshotFromReservation(input);
+    const staleRuns = this.selectWorkflowRuns(snapshot.season.id).filter(
+      (workflowRun) =>
+        workflowRun.kind === snapshot.workflowRun.kind &&
+        isActiveWorkflowStatus(workflowRun.status) &&
+        workflowRun.startedAt < input.staleActiveRunStartedBefore!,
+    );
+    for (const staleRun of staleRuns) {
+      const expiredRun = expireWorkflowRun(staleRun, input.staleFinishedAt ?? snapshot.workflowRun.startedAt);
+      this.upsertWorkflowRun(expiredRun);
+      this.database.prepare("DELETE FROM episode_states WHERE tracked_season_id = ?").run(snapshot.season.id);
+    }
   }
 
   private insertEpisodeStates(trackedSeasonId: string, episodes: EpisodeState[]): void {

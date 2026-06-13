@@ -353,6 +353,8 @@ function parseStructuredText(
 function schemaFor(schemaName: StructuredOutputRequest["schemaName"]) {
   switch (schemaName) {
     case "acquisition_planning":
+    case "movie_planning":
+      // Same output shape; the movie agent maps its single pick to ["S01E01"].
       return acquisitionPlanningSchema;
     case "package_recognition":
       return packageRecognitionSchema;

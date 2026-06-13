@@ -363,8 +363,51 @@ export async function queueCandidateSeries(candidateId: string): Promise<Candida
   };
 }
 
-export async function runScheduledType3() {
+export const LAST_SWEEP_DATE_SETTING_KEY = "last_sweep_date";
+
+/** Beijing wall-clock "date" (YYYY-MM-DD) and "HH:MM" right now. */
+function beijingDateTime(): { date: string; hhmm: string } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return { date: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
+}
+
+/**
+ * The daily 巡检. The configured sweep time is the single source of truth: any
+ * trigger (Vercel cron, self-hosted scheduler, manual) just pings this, and the
+ * gate runs the sweep at most once per Beijing day, only once the clock has
+ * reached the user-configured time — so the Settings time is authoritative
+ * regardless of how often the trigger fires. `force` bypasses the gate for
+ * on-demand "sweep now".
+ */
+export async function runScheduledType3(options?: { force?: boolean }): Promise<{
+  outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  skipped?: "already_swept_today" | "before_scheduled_time";
+  scheduledFor?: string;
+}> {
   const repository = getWorkflowRepository();
+  if (!options?.force) {
+    const target = await getDailySweepTime(repository);
+    const { date, hhmm } = beijingDateTime();
+    const lastDate = (await repository.getSetting(LAST_SWEEP_DATE_SETTING_KEY))?.trim();
+    if (date === lastDate) {
+      return { skipped: "already_swept_today", outcomes: [] };
+    }
+    if (hhmm < target) {
+      return { skipped: "before_scheduled_time", scheduledFor: target, outcomes: [] };
+    }
+    // Claim the day BEFORE running, so a second near-simultaneous trigger no-ops
+    // instead of launching a duplicate sweep.
+    await repository.setSetting(LAST_SWEEP_DATE_SETTING_KEY, date);
+  }
   await hydratePan115CookieFromDb();
   const startedAt = new Date().toISOString();
   const sync = tmdbSeasonMetadataSync();
@@ -378,7 +421,7 @@ export async function runScheduledType3() {
     ...(sync ? { syncSeasonMetadata: sync } : {}),
   });
   await pushNotificationsSince(repository, startedAt);
-  return result;
+  return { outcomes: result };
 }
 
 /**

@@ -16,7 +16,7 @@ import {
 export default function SettingsPage() {
   return (
     <div className="app-shell">
-      <AppSidebar active="none" />
+      <AppSidebar active="settings" />
       <main className="main product-main">
         <div className="section-heading library-heading">
           <div>

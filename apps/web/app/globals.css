@@ -121,6 +121,11 @@ p {
   gap: 4px;
 }
 
+/* Desktop keeps 设置 in the footer card; the nav-item duplicate is mobile-only. */
+.nav-settings-item {
+  display: none;
+}
+
 .nav-item {
   display: flex;
   align-items: center;
@@ -1039,8 +1044,38 @@ p {
     align-items: center;
     /* Compact top bar on narrow screens — the desktop 20px column padding made
        the horizontal nav far too tall. */
-    padding: 8px 12px;
-    gap: 12px;
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  /* The brand wordmark eats the width four nav items need; keep just the logo
+     mark on the mobile bar so 搜索/媒体库/通知/设置 all fit without wrapping. */
+  .brand {
+    padding: 0;
+    gap: 0;
+  }
+
+  .brand-copy {
+    display: none;
+  }
+
+  /* Push the nav to the right and let it scroll if a device is very narrow,
+     rather than wrapping item labels vertically (搜 索). */
+  .sidebar nav {
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  .nav-list {
+    justify-content: flex-end;
+    gap: 2px;
+  }
+
+  .nav-item {
+    white-space: nowrap;
+    gap: 6px;
+    padding: 8px 10px;
   }
 
   .sidebar-footer {
@@ -1049,6 +1084,11 @@ p {
 
   .nav-list {
     flex-direction: row;
+  }
+
+  /* The footer's 设置 link is hidden on mobile — show the nav-item version. */
+  .nav-settings-item {
+    display: block;
   }
 
   .main {

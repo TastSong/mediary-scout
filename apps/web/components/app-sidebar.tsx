@@ -6,7 +6,7 @@ export function AppSidebar({
   active,
   searchQuery = "",
 }: {
-  active: "search" | "library" | "notifications" | "none";
+  active: "search" | "library" | "notifications" | "settings" | "none";
   searchQuery?: string;
 }) {
   return (
@@ -42,6 +42,17 @@ export function AppSidebar({
             >
               <Bell size={16} aria-hidden />
               通知
+            </Link>
+          </li>
+          {/* The desktop sidebar puts 设置 in the footer card; on the mobile top
+              bar that footer is hidden, so surface 设置 as a nav item there. */}
+          <li className="nav-settings-item">
+            <Link
+              className={`nav-item ${active === "settings" ? "is-active" : ""}`}
+              href="/settings"
+            >
+              <Settings size={16} aria-hidden />
+              设置
             </Link>
           </li>
         </ul>

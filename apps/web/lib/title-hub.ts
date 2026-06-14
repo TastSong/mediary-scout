@@ -9,6 +9,7 @@ import {
   type PreparedSeriesTarget,
 } from "@media-track/workflow";
 import { findDemoCandidateByTmdbId } from "./demo-candidates";
+import { aggregateStateFromSeasons, type TitleAggregateState } from "./title-aggregate";
 import {
   ensureDemoSeeded,
   getWorkflowRepository,
@@ -29,7 +30,7 @@ export interface TitleHubSeason {
   episodes: EpisodeStatusCell[];
 }
 
-export type TitleAggregateState = "untracked" | "tracking" | "partial" | "complete";
+export type { TitleAggregateState };
 
 export interface TitleHubView {
   tmdbId: number;
@@ -171,16 +172,7 @@ export async function getTitleHubView(tmdbId: number): Promise<TitleHubView | nu
   const untrackedSeasonNumbers = seasons
     .filter((season) => !season.tracked)
     .map((season) => season.seasonNumber);
-  const anyTracked = seasons.some((season) => season.tracked);
-  const anyActive = seasons.some((season) => season.tracked && season.status === "active");
-  const anyMissing = seasons.some((season) => season.tracked && season.missingAiredCount > 0);
-  const aggregate: TitleAggregateState = !anyTracked
-    ? "untracked"
-    : untrackedSeasonNumbers.length > 0 || anyMissing
-      ? "partial"
-      : anyActive
-        ? "tracking"
-        : "complete";
+  const aggregate = aggregateStateFromSeasons(seasons);
 
   const acquiring = (await repository.listActiveWorkflowRuns()).some(
     (snapshot) => snapshot.title.tmdbId === tmdbId,

@@ -10,12 +10,20 @@ import {
   RequestSeasonButton,
 } from "../../../components/title-action-buttons";
 import { getTitleHubView, type TitleHubSeason } from "../../../lib/title-hub";
+import { seasonBadgeState } from "../../../lib/title-aggregate";
 
 const aggregateBadge = {
   untracked: null,
   tracking: { label: "追更中", tone: "indigo" },
   partial: { label: "部分入库", tone: "amber" },
   complete: { label: "已全部入库", tone: "green" },
+} as const;
+
+const seasonBadge = {
+  untracked: null,
+  missing: { label: "缺集", tone: "amber" },
+  airing: { label: "追更中", tone: "indigo" },
+  complete: { label: "已完结", tone: "green" },
 } as const;
 
 export default async function ShowPage({
@@ -152,13 +160,7 @@ function SeasonRow({
   const aired = Math.min(season.latestAiredEpisode, season.totalEpisodes);
   const percent = aired > 0 ? Math.round((season.obtainedCount / aired) * 100) : 0;
 
-  const badge = !season.tracked
-    ? null
-    : season.missingAiredCount > 0
-      ? { label: "缺集", tone: "amber" }
-      : season.status === "active"
-        ? { label: "追更中", tone: "indigo" }
-        : { label: "已完结", tone: "green" };
+  const badge = seasonBadge[seasonBadgeState(season)];
 
   const rowBody = (
     <>

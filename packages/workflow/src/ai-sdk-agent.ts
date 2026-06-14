@@ -20,6 +20,11 @@ import type {
   MovieMasterSelectionInput,
   MoviePlanningInput,
 } from "./ports.js";
+import {
+  MAX_DISTINCT_PLANNING_SEARCHES,
+  decideSearchGate,
+  normalizeSearchKeyword,
+} from "./planning-search-gate.js";
 
 // The shipped default model — any OpenAI-compatible endpoint works; override
 // with AGENT_MODEL_BASE_URL / AGENT_MODEL_ID / AGENT_MODEL_API_KEY.
@@ -33,6 +38,24 @@ function perfLog(message: string): void {
   if (process.env.MEDIA_TRACK_PERF_LOG) {
     console.error(`[perf] ${message}`);
   }
+}
+
+/** The candidate-evidence shape the planning agents see for one search. */
+function summarizeSnapshot(snapshot: ResourceSnapshot) {
+  return {
+    snapshotId: snapshot.id,
+    provider: snapshot.provider,
+    keyword: snapshot.keyword,
+    candidateCount: snapshot.candidates.length,
+    candidates: snapshot.candidates.map((candidate) => ({
+      id: candidate.id,
+      title: candidate.title,
+      type: candidate.type,
+      source: candidate.source,
+      episodeHints: candidate.episodeHints,
+      qualityHints: candidate.qualityHints,
+    })),
+  };
 }
 
 const acquisitionPlanningSchema = z.object({
@@ -114,6 +137,12 @@ export class VercelAiAgentNodes implements AgentNodes {
 
   async planAcquisition(input: AcquisitionPlanningInput): Promise<AcquisitionPlanningResult> {
     const snapshots: ResourceSnapshot[] = [];
+    // Deterministic search guardrails (the Mimo model ignores "be economical"
+    // prompt text and was observed thrashing 16 PanSou searches). Dedup repeats
+    // for free and cap distinct searches — both at the tool boundary so the
+    // model cannot override them. See planning-search-gate.ts.
+    const seenKeywords = new Set<string>();
+    const summaryByKeyword = new Map<string, ReturnType<typeof summarizeSnapshot>>();
     const result = await runAgentNode({
       spec: AGENT_NODE_SPECS.AcquisitionPlanningAgent,
       input: {
@@ -133,24 +162,38 @@ export class VercelAiAgentNodes implements AgentNodes {
             "Search the resource provider with one keyword. Read-only. Returns the full persisted ResourceSnapshot; judge from this complete evidence. Returns {keyword, error} when the provider fails.",
           inputSchema: AGENT_NODE_SPECS.AcquisitionPlanningAgent.toolInputSchemas.searchResources,
           execute: async ({ keyword }) => {
+            const normalized = normalizeSearchKeyword(keyword);
+            const decision = decideSearchGate({
+              normalizedKeyword: normalized,
+              seenKeywords,
+              maxDistinctSearches: MAX_DISTINCT_PLANNING_SEARCHES,
+            });
+            if (decision === "duplicate") {
+              perfLog(`pansou search "${keyword}" deduped (already searched)`);
+              const prior = summaryByKeyword.get(normalized);
+              return {
+                ...(prior ?? { keyword }),
+                note: `Already searched "${keyword}" this run (${prior?.candidateCount ?? 0} candidates). Do not repeat keywords — vary the keyword or decide from the evidence already gathered.`,
+              };
+            }
+            if (decision === "exhausted") {
+              perfLog(`pansou search "${keyword}" refused (budget ${MAX_DISTINCT_PLANNING_SEARCHES} exhausted)`);
+              return {
+                keyword,
+                error: `Search budget exhausted (${MAX_DISTINCT_PLANNING_SEARCHES} distinct searches this run). Decide from the ${snapshots.length} snapshots already observed; do not request more searches.`,
+              };
+            }
+            seenKeywords.add(normalized);
+            const ts = Date.now();
             try {
               const snapshot = await input.searchResources({ keyword });
+              perfLog(`pansou search "${keyword}" ${Date.now() - ts}ms → ${snapshot.candidates.length} candidates`);
               snapshots.push(snapshot);
-              return {
-                snapshotId: snapshot.id,
-                provider: snapshot.provider,
-                keyword: snapshot.keyword,
-                candidateCount: snapshot.candidates.length,
-                candidates: snapshot.candidates.map((candidate) => ({
-                  id: candidate.id,
-                  title: candidate.title,
-                  type: candidate.type,
-                  source: candidate.source,
-                  episodeHints: candidate.episodeHints,
-                  qualityHints: candidate.qualityHints,
-                })),
-              };
+              const summary = summarizeSnapshot(snapshot);
+              summaryByKeyword.set(normalized, summary);
+              return summary;
             } catch (error) {
+              perfLog(`pansou search "${keyword}" ${Date.now() - ts}ms → ERROR`);
               return { keyword, error: error instanceof Error ? error.message : String(error) };
             }
           },
@@ -199,20 +242,7 @@ export class VercelAiAgentNodes implements AgentNodes {
               const snapshot = await input.searchResources({ keyword });
               perfLog(`pansou search "${keyword}" ${Date.now() - ts}ms → ${snapshot.candidates.length} candidates`);
               snapshots.push(snapshot);
-              return {
-                snapshotId: snapshot.id,
-                provider: snapshot.provider,
-                keyword: snapshot.keyword,
-                candidateCount: snapshot.candidates.length,
-                candidates: snapshot.candidates.map((candidate) => ({
-                  id: candidate.id,
-                  title: candidate.title,
-                  type: candidate.type,
-                  source: candidate.source,
-                  episodeHints: candidate.episodeHints,
-                  qualityHints: candidate.qualityHints,
-                })),
-              };
+              return summarizeSnapshot(snapshot);
             } catch (error) {
               perfLog(`pansou search "${keyword}" ${Date.now() - ts}ms → ERROR`);
               return { keyword, error: error instanceof Error ? error.message : String(error) };

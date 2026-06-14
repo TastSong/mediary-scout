@@ -23,7 +23,13 @@ export interface ResourceSnapshotV2 {
   candidates: SimResourceCandidate[];
 }
 
-export class FakeResourceProviderV2 {
+/** The provider surface the sandbox depends on — the fake and the real PanSou
+ *  adapter both satisfy it. */
+export interface ResourceProviderV2 {
+  search(keyword: string): Promise<ResourceSnapshotV2>;
+}
+
+export class FakeResourceProviderV2 implements ResourceProviderV2 {
   private readonly results: Map<string, SimResourceCandidate[]>;
   private readonly errorKeywords: Set<string>;
 

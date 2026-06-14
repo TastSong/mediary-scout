@@ -1,5 +1,6 @@
 import {
   createEpisodeStates,
+  episodeNumberFromCode,
   getTrackedSeasonStatusView,
   InMemoryWorkflowRepository,
   type EpisodeState,
@@ -115,7 +116,9 @@ function seedEpisodes(season: TrackedSeason): EpisodeState[] {
     totalEpisodes: season.totalEpisodes,
     latestAiredEpisode: season.latestAiredEpisode,
   }).map((episode) => {
-    const episodeNumber = Number(episode.episodeCode.slice(-2));
+    // Use the canonical parser, not slice(-2): the latter silently breaks for
+    // episodes >= 100 ("S01E100".slice(-2) === "00").
+    const episodeNumber = episodeNumberFromCode(episode.episodeCode);
     if (episodeNumber <= 12) {
       return {
         ...episode,

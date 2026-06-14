@@ -53,7 +53,9 @@ export interface StorageV2 {
    *  the source of the wrapper-dir handle flatten removes. */
   listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>>;
   moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
-  deleteFiles(input: { fileIds: string[] }): Promise<{ deleted: string[] }>;
+  /** Delete files scoped to a directory — real 115 deletion is directory-scoped,
+   *  so the caller names the dir the files live in. */
+  deleteFiles(input: { directoryId: string; fileIds: string[] }): Promise<{ deleted: string[] }>;
   /** Remove a directory and everything nested under it (the flatten peel-off). */
   removeDirectory(input: { directoryId: string }): Promise<{ removed: string[] }>;
 }
@@ -213,7 +215,9 @@ export class Storage115Simulator implements StorageV2 {
     return { removed };
   }
 
-  async deleteFiles(input: { fileIds: string[] }): Promise<{ deleted: string[] }> {
+  async deleteFiles(input: { directoryId: string; fileIds: string[] }): Promise<{ deleted: string[] }> {
+    // directoryId names the scope the caller already validated; the in-memory
+    // store deletes by global id (the real 115 executor uses it to scope-assert).
     this.spendBudget(input.fileIds.length);
     const deleted: string[] = [];
     for (const fileId of input.fileIds) {

@@ -356,6 +356,27 @@ describe("Storage115Executor", () => {
     expect(api.removedOfflineHashes).toEqual([]);
   });
 
+  it("lists nested subdirectories recursively (the flatten wrapper-dir source)", async () => {
+    const api = new FakePan115Api({
+      directories: {
+        staging: [{ isDirectory: true, cid: "wrap", n: "[Grp] Show S01" }],
+        wrap: [
+          { isDirectory: true, cid: "inner", n: "Extras" },
+          { fid: "f1", n: "Show - 01.mkv", s: "9" },
+        ],
+        inner: [{ fid: "f2", n: "NCOP.mkv", s: "1" }],
+      },
+    });
+    const executor = new Storage115Executor({ api });
+
+    const subdirs = await executor.listSubdirectories({ directoryId: "staging" });
+
+    expect(subdirs).toEqual([
+      { id: "wrap", path: "[Grp] Show S01" },
+      { id: "inner", path: "[Grp] Show S01/Extras" },
+    ]);
+  });
+
   it("cancels a non-秒传 offline task so it does not drain the quota", async () => {
     const api = new FakePan115Api();
     // Nothing materializes in the grace window → 115 has no cached copy → the

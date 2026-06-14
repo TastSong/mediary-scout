@@ -51,6 +51,9 @@ export interface StorageExecutor {
   removeDirectory(directoryId: string): Promise<{ removed: boolean }>;
   /** Path-preserving recursive snapshot of a staging directory (all files, not just videos). */
   listTree(input: { directoryId: string; maxDepth?: number }): Promise<PackageTreeFile[]>;
+  /** Recursive subdirectories under a directory (path relative to it) — the source
+   *  of the wrapper-dir handle the flatten step removes. */
+  listSubdirectories(input: { directoryId: string; maxDepth?: number }): Promise<Array<{ id: string; path: string }>>;
   /** Move files (by provider file id) into a target directory inside the write scope. */
   moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }>;
 }

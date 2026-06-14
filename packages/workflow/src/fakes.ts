@@ -268,6 +268,30 @@ export class FakeStorageExecutor implements StorageExecutor {
     return [...configured, ...transferred];
   }
 
+  async listSubdirectories(input: {
+    directoryId: string;
+    maxDepth?: number;
+  }): Promise<Array<{ id: string; path: string }>> {
+    // This fake stores a flat directory map, so subdirectories only exist as
+    // path prefixes inside a configured package tree. Derive the distinct prefixes
+    // (id = path, since the fake assigns no separate directory ids).
+    const seen = new Set<string>();
+    const out: Array<{ id: string; path: string }> = [];
+    for (const file of this.packageTrees.get(input.directoryId) ?? []) {
+      const segments = file.path.split("/").filter((segment) => segment.length > 0);
+      segments.pop(); // drop the file name
+      let prefix = "";
+      for (const segment of segments) {
+        prefix = prefix ? `${prefix}/${segment}` : segment;
+        if (!seen.has(prefix)) {
+          seen.add(prefix);
+          out.push({ id: prefix, path: prefix });
+        }
+      }
+    }
+    return out;
+  }
+
   async moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }> {
     const wanted = new Set(input.fileIds);
     const moved: string[] = [];

@@ -556,6 +556,35 @@ export class Storage115Executor implements StorageExecutor {
     return results;
   }
 
+  async listSubdirectories(input: {
+    directoryId: string;
+    maxDepth?: number;
+  }): Promise<Array<{ id: string; path: string }>> {
+    const safeRoot = this.assertSafeRecursiveListTarget(input.directoryId, "list subdirectories of");
+    const maxDepth = input.maxDepth ?? 6;
+    const results: Array<{ id: string; path: string }> = [];
+    const walk = async (directoryId: string, prefix: string, depth: number): Promise<void> => {
+      if (depth > maxDepth) {
+        return;
+      }
+      const items = await this.callApi("listItems", () => this.api.listItems({ directoryId }));
+      for (const item of items) {
+        if (!isDirectory(item)) {
+          continue;
+        }
+        const childId = directoryIdFromItem(item);
+        if (!childId) {
+          continue;
+        }
+        const path = `${prefix}${itemName(item)}`;
+        results.push({ id: childId, path });
+        await walk(childId, `${path}/`, depth + 1);
+      }
+    };
+    await walk(safeRoot, "", 1);
+    return results;
+  }
+
   async moveFiles(input: { fileIds: string[]; targetDirectoryId: string }): Promise<{ moved: string[] }> {
     if (input.fileIds.length === 0) {
       return { moved: [] };

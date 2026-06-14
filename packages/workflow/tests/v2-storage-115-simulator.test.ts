@@ -93,7 +93,7 @@ describe("Storage115Simulator — move + name collision", () => {
     const dir = await sim.createDirectory({ name: "d", parentId: "root" });
     await sim.transferCandidate({ candidateId: "cand_a", intoDirectoryId: dir });
     const files = await sim.listTree({ directoryId: dir });
-    const result = await sim.deleteFiles({ fileIds: [files[0]!.id] });
+    const result = await sim.deleteFiles({ directoryId: dir, fileIds: [files[0]!.id] });
     expect(result.deleted).toEqual([files[0]!.id]);
     expect((await sim.listTree({ directoryId: dir })).map((f) => f.path)).toEqual(["b.mkv"]);
   });

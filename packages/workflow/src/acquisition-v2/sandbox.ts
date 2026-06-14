@@ -210,7 +210,7 @@ export class TaskSandbox {
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_${input.directory.toUpperCase()}: ${outOfScope.join(",")}`);
     }
-    const { deleted } = await this.storage.deleteFiles({ fileIds: input.fileIds });
+    const { deleted } = await this.storage.deleteFiles({ directoryId, fileIds: input.fileIds });
     return { deleted, directory: await this.storage.listTree({ directoryId }) };
   }
 

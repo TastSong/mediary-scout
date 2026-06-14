@@ -22,6 +22,8 @@ export interface TaskSandboxOptions {
   /** Scoped storage + the staging handle this task may transfer into. */
   storage?: StorageV2;
   stagingDirectoryId?: string;
+  /** The scoped Season N directory this task may move target files into. */
+  targetSeasonDirectoryId?: string;
 }
 
 export interface SearchToolResult {
@@ -45,6 +47,7 @@ export class TaskSandbox {
   private readonly searchBudget: number;
   private readonly storage: StorageV2 | undefined;
   private readonly stagingDirectoryId: string | undefined;
+  private readonly targetSeasonDirectoryId: string | undefined;
   private readonly seenKeywords = new Set<string>();
   private readonly snapshotByKeyword = new Map<string, ResourceSnapshotV2>();
   private readonly observedSnapshots = new Map<string, ResourceSnapshotV2>();
@@ -54,6 +57,7 @@ export class TaskSandbox {
     this.searchBudget = options.searchBudget ?? MAX_DISTINCT_PLANNING_SEARCHES;
     this.storage = options.storage;
     this.stagingDirectoryId = options.stagingDirectoryId;
+    this.targetSeasonDirectoryId = options.targetSeasonDirectoryId;
   }
 
   /** Search one keyword. Repeats are deduped (no extra provider hit); distinct
@@ -109,5 +113,29 @@ export class TaskSandbox {
     });
     const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
     return { attempt, staging };
+  }
+
+  /** Move the agent-selected files out of staging into the scoped Season dir
+   *  (the 挖取/extract). Scope guard: every file must currently be in THIS
+   *  task's staging — the agent can't move arbitrary ids. Rereads both dirs. */
+  async moveToSeason(input: { fileIds: string[] }): Promise<{ season: SimTreeFile[]; staging: SimTreeFile[] }> {
+    if (!this.storage || !this.stagingDirectoryId || !this.targetSeasonDirectoryId) {
+      throw new Error("SANDBOX: no storage/staging/season handle configured");
+    }
+    const stagingIds = new Set(
+      (await this.storage.listTree({ directoryId: this.stagingDirectoryId })).map((file) => file.id),
+    );
+    const outOfScope = input.fileIds.filter((fileId) => !stagingIds.has(fileId));
+    if (outOfScope.length > 0) {
+      throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
+    }
+    await this.storage.moveFiles({
+      fileIds: input.fileIds,
+      targetDirectoryId: this.targetSeasonDirectoryId,
+    });
+    return {
+      season: await this.storage.listTree({ directoryId: this.targetSeasonDirectoryId }),
+      staging: await this.storage.listTree({ directoryId: this.stagingDirectoryId }),
+    };
   }
 }

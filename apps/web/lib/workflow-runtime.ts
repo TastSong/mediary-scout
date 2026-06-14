@@ -26,6 +26,7 @@ import {
   runScheduledType3Monitoring,
   sendPushNotifications,
   SQLiteWorkflowRepository,
+  createPostgresWorkflowRepositorySync,
   type AgentNodes,
   type MediaSearchCandidate,
   type MediaTitle,
@@ -53,7 +54,7 @@ export type CandidateTrackingRequestResult =
     };
 
 let database: DatabaseSync | null = null;
-let repository: SQLiteWorkflowRepository | null = null;
+let repository: WorkflowRepository | null = null;
 let demoSeedPromise: Promise<void> | null = null;
 let fakeResourceProvider: ResourceProvider | null = null;
 let fakeStorageExecutor: StorageExecutor | null = null;
@@ -68,9 +69,12 @@ export function getWebDatabase(): DatabaseSync {
   return database;
 }
 
-export function getWorkflowRepository(): SQLiteWorkflowRepository {
+export function getWorkflowRepository(): WorkflowRepository {
   if (!repository) {
-    repository = new SQLiteWorkflowRepository(getWebDatabase());
+    const postgresUrl = process.env.MEDIA_TRACK_POSTGRES_URL?.trim();
+    repository = postgresUrl
+      ? createPostgresWorkflowRepositorySync({ connectionString: postgresUrl })
+      : new SQLiteWorkflowRepository(getWebDatabase());
   }
   return repository;
 }

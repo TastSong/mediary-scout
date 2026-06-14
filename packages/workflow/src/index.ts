@@ -14,6 +14,7 @@ export * from "./episode-code.js";
 export * from "./package-init.js";
 export * from "./repository.js";
 export * from "./sqlite.js";
+export * from "./postgres.js";
 export * from "./runner.js";
 export * from "./worker.js";
 export * from "./commands.js";

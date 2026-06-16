@@ -20,6 +20,10 @@ import { ensureDemoSeeded, getWorkflowRepository } from "../../lib/workflow-runt
 // The kind only drives the leading ICON now — its textual label used to render
 // as a second badge next to the status pill ("开始追踪" beside "已完结"), which
 // was redundant. The status pill is the single source of truth for state.
+// TMDB's own CDN — same source the push notification uses; w154 is a crisp
+// thumbnail for the feed card without shipping a self-hosted image.
+const TMDB_FEED_POSTER = "https://image.tmdb.org/t/p/w154";
+
 const kindIcon: Record<string, { tone: string; icon: typeof Bell }> = {
   series_initialized: { tone: "green", icon: Layers },
   package_initialized: { tone: "green", icon: Film },
@@ -134,15 +138,27 @@ function NotificationCard({ notification }: { notification: NotificationEvent })
 
   const status = statusMeta[report.status];
   const StatusIcon = status.icon;
-  const heading = report.seasonLabel ? `${report.titleName} ${report.seasonLabel}` : report.titleName;
+  const heading = report.seasonLabel
+    ? `${report.titleName} ${report.seasonLabel}`
+    : report.year
+      ? `${report.titleName} (${report.year})`
+      : report.titleName;
   // A movie's only line is "已获取入库", which the "已入库" pill already conveys —
   // drop it so the card carries no duplicated sentence. Seasons keep their
   // informative progress line(s).
   const lines = report.status === "acquired" ? [] : report.lines;
   const hasChips = report.newlyObtained.length > 0 || report.realMissing.length > 0 || Boolean(report.quality);
+  // The same TMDB poster the push uses — a small thumbnail turns the row into a
+  // proper media card (parity with the WeChat/Bark notification).
+  const posterUrl = report.posterPath ? `${TMDB_FEED_POSTER}${report.posterPath}` : null;
 
   return (
-    <article className="feed-card">
+    <article className={`feed-card${posterUrl ? " has-poster" : ""}`}>
+      {posterUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img className="feed-poster" src={posterUrl} alt="" loading="lazy" />
+      ) : null}
+      <div className="feed-card-body">
       <div className="feed-card-head">
         <span className={`feed-icon tone-${icon.tone}`}>
           <KindIcon size={15} aria-hidden />
@@ -181,6 +197,7 @@ function NotificationCard({ notification }: { notification: NotificationEvent })
           ) : null}
         </div>
       ) : null}
+      </div>
     </article>
   );
 }

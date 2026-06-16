@@ -192,7 +192,7 @@ describe("dispatchNotifications", () => {
     const sent = JSON.parse(requests[0]!.body);
     expect(sent.imageUrl).toBe("https://image.tmdb.org/t/p/w500/p.jpg");
     expect(sent.url).toBe("https://app.example.com/show/1184918");
-    expect(sent.markdown).toContain("![](https://image.tmdb.org/t/p/w500/p.jpg)");
+    expect(sent.markdown).toContain('<img src="https://image.tmdb.org/t/p/w500/p.jpg" width="50%"');
   });
 
   it("falls back to plain {title, text} when a notification has no report", async () => {
@@ -230,8 +230,11 @@ describe("buildNotifyMessage — rich per-channel push payload (L2)", () => {
     expect(msg.text).toContain("已获取入库"); // plain-text fallback unchanged
     expect(msg.imageUrl).toBe("https://image.tmdb.org/t/p/w500/abc.jpg"); // TMDB CDN — no self-hosting
     expect(msg.url).toBe("https://app.example.com/show/1184918");
-    expect(msg.markdown).toContain("![](https://image.tmdb.org/t/p/w500/abc.jpg)");
-    expect(msg.markdown).toContain("热辣滚烫 (2024)");
+    // Poster is a half-width <img> (Server酱's full-width ![]() overflowed the phone).
+    expect(msg.markdown).toContain('<img src="https://image.tmdb.org/t/p/w500/abc.jpg" width="50%"');
+    // The head lives in the `title` field; repeating it as a markdown heading
+    // rendered a duplicate title under the poster — the body must NOT carry it.
+    expect(msg.markdown).not.toContain("**热辣滚烫 (2024)**");
     expect(msg.markdown).toContain("2160p");
     expect(msg.markdown).toContain("https://app.example.com/show/1184918");
   });
@@ -246,7 +249,7 @@ describe("buildNotifyMessage — rich per-channel push payload (L2)", () => {
   it("omits the poster when the title has no posterPath", () => {
     const msg = buildNotifyMessage(movieReport({ posterPath: null }), { webBaseUrl: "https://app.example.com" });
     expect(msg.imageUrl).toBeUndefined();
-    expect(msg.markdown).not.toContain("![](");
+    expect(msg.markdown).not.toContain("<img");
   });
 
   it("a TV season carries the season label, not a movie year, in the title", () => {

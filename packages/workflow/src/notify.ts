@@ -50,9 +50,12 @@ export function buildNotifyMessage(
 
   const md: string[] = [];
   if (imageUrl) {
-    md.push(`![](${imageUrl})`, "");
+    // Half-width <img>, not ![](): Server酱 renders bare markdown images at the
+    // full container width, which overflowed the phone screen. Every channel
+    // already shows `head` as its own title field, so the body must NOT repeat
+    // it as a markdown heading (that rendered a duplicate title under the poster).
+    md.push(`<img src="${imageUrl}" width="50%" />`, "");
   }
-  md.push(`**${head}**`, "");
   for (const line of report.lines) {
     md.push(`- ${line}`);
   }

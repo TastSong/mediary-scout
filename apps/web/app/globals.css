@@ -1176,6 +1176,40 @@ p {
   gap: 8px;
 }
 
+/* With a poster the card becomes a media object: poster column on the left,
+   the existing head/lines/chips stack on the right. Posterless cards (legacy
+   events, routine) keep the plain single-column layout. */
+.feed-card.has-poster {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 14px;
+}
+
+.feed-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.feed-poster {
+  width: 54px;
+  flex-shrink: 0;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--bg-raised);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* The poster already supplies the left indent, so the body's lines/chips don't
+   need the icon-column padding. */
+.feed-card.has-poster .feed-card-lines,
+.feed-card.has-poster .feed-card-chips {
+  padding-left: 0;
+}
+
 .feed-card-head {
   display: flex;
   align-items: center;

@@ -228,14 +228,32 @@ function formatMovieDate(releaseDate: string): string {
   return match ? `${match[1]}年${Number(match[2])}月${Number(match[3])}日` : releaseDate;
 }
 
-/** Contextual placeholder while the hub's first render streams in. */
+/** Contextual placeholder while the hub's first render streams in. Mirrors the
+ *  real hub SHAPE (poster + title block header, then the season list) so the
+ *  swap to real content doesn't reflow — reuses the same layout containers. A
+ *  movie resolves with no seasons, but the header (the dominant region) matches
+ *  both, and the season rows cover the common TV case. */
 function HubSkeleton() {
   return (
     <section className="title-hub">
-      <div className="skeleton skeleton-stage" />
-      <div className="skeleton skeleton-heading" />
-      <div className="skeleton skeleton-metric" />
-      <div className="skeleton skeleton-metric" />
+      <header className="hub-header">
+        <div className="skeleton skeleton-hub-poster" />
+        <div className="skeleton-hub-titleblock">
+          <div className="skeleton skeleton-hub-badge" />
+          <div className="skeleton skeleton-hub-h1" />
+          <div className="skeleton skeleton-hub-line" />
+          <div className="skeleton skeleton-hub-line short" />
+          <div className="skeleton skeleton-hub-line short" />
+        </div>
+      </header>
+      <section className="hub-seasons" aria-hidden>
+        <div className="skeleton skeleton-hub-section" />
+        <ul className="hub-season-list">
+          <li className="skeleton skeleton-hub-row" />
+          <li className="skeleton skeleton-hub-row" />
+          <li className="skeleton skeleton-hub-row" />
+        </ul>
+      </section>
     </section>
   );
 }

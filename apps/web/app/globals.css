@@ -1035,12 +1035,59 @@ p {
   margin-bottom: 20px;
 }
 
-.skeleton-stage {
-  height: 248px;
+/* Notification feed card placeholder — matches the poster-card height. */
+.skeleton-feed-card {
+  height: 92px;
 }
 
-.skeleton-metric {
-  height: 66px;
+/* Title-hub skeleton — mirrors the real hub header (poster + title block) and
+   season list so the swap to content doesn't reflow. */
+.skeleton-hub-poster {
+  width: 180px;
+  min-width: 180px;
+  aspect-ratio: 2 / 3;
+  border-radius: 10px;
+}
+
+.skeleton-hub-titleblock {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  padding-bottom: 6px;
+}
+
+.skeleton-hub-badge {
+  width: 88px;
+  height: 24px;
+  border-radius: var(--radius-pill);
+}
+
+.skeleton-hub-h1 {
+  width: 60%;
+  min-width: 220px;
+  height: 34px;
+}
+
+.skeleton-hub-line {
+  width: 100%;
+  max-width: 460px;
+  height: 14px;
+}
+
+.skeleton-hub-line.short {
+  max-width: 340px;
+}
+
+.skeleton-hub-section {
+  width: 150px;
+  height: 22px;
+}
+
+.skeleton-hub-row {
+  height: 56px;
+  list-style: none;
 }
 
 /* ---------- responsive ---------- */

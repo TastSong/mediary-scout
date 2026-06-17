@@ -392,9 +392,9 @@ function FeedSkeleton() {
   return (
     <section className="feed">
       <div className="skeleton skeleton-heading" />
-      <div className="skeleton skeleton-metric" />
-      <div className="skeleton skeleton-metric" />
-      <div className="skeleton skeleton-metric" />
+      <div className="skeleton skeleton-feed-card" />
+      <div className="skeleton skeleton-feed-card" />
+      <div className="skeleton skeleton-feed-card" />
     </section>
   );
 }

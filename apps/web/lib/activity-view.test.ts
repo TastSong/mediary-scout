@@ -107,4 +107,17 @@ describe("getActivityView", () => {
     expect(done.workflowRunId).toBe("r_done");
     expect(done.sizeText).toBe("每集 约 410 MB");
   });
+
+  it("backfills a missing recentCompleted poster from the tracked title (old notifications lack posterPath)", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const snap = run({ id: "r_old", tmdbId: 7, name: "OldNoPoster", status: "succeeded", startedAt: "2026-06-17T00:02:00Z", finishedAt: "2026-06-17T00:02:30Z" });
+    // Simulate an OLD notification written before reports carried posterPath.
+    snap.notifications[0]!.report!.posterPath = null;
+    await repo.saveWorkflowRunSnapshot(snap);
+
+    const view = await getActivityView({ repository: repo });
+
+    const done = view.recentCompleted.find((c) => c.title === "OldNoPoster")!;
+    expect(done.posterPath).toBe("/p7.jpg"); // backfilled from the still-tracked title
+  });
 });

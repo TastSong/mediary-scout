@@ -51,9 +51,26 @@ export interface ActivityView {
  * runs it watched go active → done; history lives in 通知).
  */
 export async function getActivityView(input: {
-  repository: Pick<WorkflowRepository, "listActiveWorkflowRuns" | "listNotifications">;
+  repository: Pick<
+    WorkflowRepository,
+    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates"
+  >;
 }): Promise<ActivityView> {
   const activeRuns = await input.repository.listActiveWorkflowRuns();
+
+  // Poster backfill source: older notifications predate report.posterPath, so a
+  // completed item can lack a poster. The title is still tracked → source the
+  // poster from it (by tmdbId, falling back to title name) so 已完成 shows the
+  // real poster instead of the text fallback.
+  const trackedStates = await input.repository.listTrackedSeasonStates();
+  const posterByTmdb = new Map<number, string>();
+  const posterByName = new Map<string, string>();
+  for (const state of trackedStates) {
+    if (state.title.posterPath) {
+      posterByTmdb.set(state.title.tmdbId, state.title.posterPath);
+      posterByName.set(state.title.title, state.title.posterPath);
+    }
+  }
 
   // Queue positions: oldest-queued is position 1 (FIFO, matching the worker).
   const queuedOrder = activeRuns
@@ -94,12 +111,17 @@ export async function getActivityView(input: {
     .map((notification) => {
       const report = notification.report!;
       const size = landedSize(report);
+      const posterPath =
+        report.posterPath ??
+        (report.tmdbId != null ? posterByTmdb.get(report.tmdbId) : undefined) ??
+        posterByName.get(report.titleName) ??
+        null;
       return {
         workflowRunId: notification.workflowRunId,
         title: report.titleName,
         seasonLabel: report.seasonLabel,
         status: report.status,
-        posterPath: report.posterPath ?? null,
+        posterPath,
         sizeText: size ? `${size.label} ${size.value}` : null,
         createdAt: notification.createdAt,
       };

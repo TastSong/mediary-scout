@@ -1,12 +1,13 @@
 import { connection } from "next/server";
 import { Suspense } from "react";
-import { Bell, Bot, Cable, CalendarClock, Gauge, Languages, ShieldCheck, TriangleAlert } from "lucide-react";
+import { Bell, Bot, Cable, CalendarClock, Clapperboard, Gauge, Languages, ShieldCheck, TriangleAlert } from "lucide-react";
 import { AppSidebar } from "../../components/app-sidebar";
 import { Pan115QrConnect } from "../../components/pan115-qr-connect";
 import { PushNotificationForm } from "../../components/push-notification-form";
 import { PreferredLanguageForm } from "../../components/preferred-language-form";
 import { QualityPreferenceForm } from "../../components/quality-preference-form";
 import { LlmConfigForm } from "../../components/llm-config-form";
+import { TmdbApiKeyForm } from "../../components/tmdb-api-key-form";
 import { DailySweepForm } from "../../components/daily-sweep-form";
 import {
   getDailySweepTime,
@@ -17,6 +18,7 @@ import {
   LLM_BASE_URL_SETTING_KEY,
   LLM_MODEL_ID_SETTING_KEY,
   LLM_API_KEY_SETTING_KEY,
+  TMDB_API_KEY_SETTING_KEY,
 } from "../../lib/workflow-runtime";
 
 export default function SettingsPage() {
@@ -41,6 +43,9 @@ export default function SettingsPage() {
         </Suspense>
         <Suspense fallback={<div className="skeleton skeleton-heading" />}>
           <LlmConfigSection />
+        </Suspense>
+        <Suspense fallback={<div className="skeleton skeleton-heading" />}>
+          <TmdbApiKeySection />
         </Suspense>
         <Suspense fallback={<div className="skeleton skeleton-heading" />}>
           <DailySweepSection />
@@ -114,6 +119,27 @@ async function LlmConfigSection() {
         </div>
       </div>
       <LlmConfigForm baseURL={baseURL} modelId={modelId} apiKeySet={apiKeySet} />
+    </section>
+  );
+}
+
+async function TmdbApiKeySection() {
+  await connection();
+  const repository = getWorkflowRepository();
+  const apiKeySet = Boolean((await repository.getSetting(TMDB_API_KEY_SETTING_KEY))?.trim());
+
+  return (
+    <section className="panel" style={{ maxWidth: 720, marginTop: 24 }}>
+      <div className="panel-header">
+        <div>
+          <h2 className="panel-title">
+            <Clapperboard size={16} aria-hidden style={{ verticalAlign: "-2px", marginRight: 8 }} />
+            TMDB 元数据
+          </h2>
+          <p className="panel-note">影视元数据来源；默认走代理兜底，可填自己的 key 直连</p>
+        </div>
+      </div>
+      <TmdbApiKeyForm apiKeySet={apiKeySet} />
     </section>
   );
 }

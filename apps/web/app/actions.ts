@@ -297,6 +297,31 @@ export async function saveLlmConfigAction(input: {
   }
 }
 
+export async function saveTmdbApiKeyAction(apiKey: string): Promise<PushSettingsActionResult> {
+  try {
+    const { getWorkflowRepository, TMDB_API_KEY_SETTING_KEY } = await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    // Blank submit keeps the stored key (the form never echoes it back).
+    const trimmed = apiKey.trim();
+    if (trimmed) {
+      await repository.setSetting(TMDB_API_KEY_SETTING_KEY, trimmed);
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearTmdbApiKeyAction(): Promise<PushSettingsActionResult> {
+  try {
+    const { getWorkflowRepository, TMDB_API_KEY_SETTING_KEY } = await import("../lib/workflow-runtime");
+    await getWorkflowRepository().setSetting(TMDB_API_KEY_SETTING_KEY, "");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
 export async function testPushNotificationAction(
   settings: Record<string, string>,
 ): Promise<PushSettingsActionResult> {

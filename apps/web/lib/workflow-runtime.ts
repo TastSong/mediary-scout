@@ -1390,6 +1390,10 @@ function extractStorageCredential(
  * fresh drive has no write scope yet, and the scope is meant to come FROM these
  * dirs (the catch-22 that left 115 drives stuck "目录待建"). Bounded, idempotent
  * (find-or-create, no deletes). 115 root and 夸克 root are both "0"; 光鸭 root is "".
+ *
+ * 夸克 directory names can be customised via QUARK_ROOT_DIR / QUARK_MOVIES_DIR /
+ * QUARK_TV_DIR / QUARK_ANIME_DIR env vars (unset = default names).
+ * QUARK_ROOT_DIR="" places the category dirs at the account root.
  */
 async function provisionDriveCategoryDirs(
   provider: string,
@@ -1416,7 +1420,32 @@ async function provisionDriveCategoryDirs(
       listChildDirs: (parentId: string) => executor.listChildDirectories(parentId),
       createDirectory: (dir) => executor.createDirectory(dir),
     },
+    ...(provider === "quark" ? quarkDirOptionsFromEnv() : {}),
   });
+}
+
+/** Read 夸克 custom directory names from env; unset → defaults inside provisionCategoryDirs. */
+function quarkDirOptionsFromEnv(): {
+  rootName?: string;
+  moviesName?: string;
+  tvName?: string;
+  animeName?: string;
+} {
+  const opts: ReturnType<typeof quarkDirOptionsFromEnv> = {};
+  const rootDir = process.env.QUARK_ROOT_DIR;
+  if (rootDir !== undefined) {
+    opts.rootName = rootDir;
+  }
+  if (process.env.QUARK_MOVIES_DIR) {
+    opts.moviesName = process.env.QUARK_MOVIES_DIR;
+  }
+  if (process.env.QUARK_TV_DIR) {
+    opts.tvName = process.env.QUARK_TV_DIR;
+  }
+  if (process.env.QUARK_ANIME_DIR) {
+    opts.animeName = process.env.QUARK_ANIME_DIR;
+  }
+  return opts;
 }
 
 /**
@@ -2252,6 +2281,7 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
         listChildDirs: (parentId: string) => executor.listChildDirectories(parentId),
         createDirectory: (dir) => executor.createDirectory(dir),
       },
+      ...quarkDirOptionsFromEnv(),
     });
   } catch (error) {
     console.error(`[media-track] 夸克 directory provision failed (will store without CIDs): ${String(error)}`);

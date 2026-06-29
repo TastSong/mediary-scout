@@ -5,7 +5,12 @@ import type {
   ResourceType,
 } from "./domain.js";
 import type { ResourceProvider } from "./ports.js";
-import { extractEpisodeHints, extractQualityHints } from "./resource-hints.js";
+import {
+  classifyCandidateTitle,
+  extractEpisodeHints,
+  extractQualityHints,
+  TRANSPARENCY_SORT_ORDER,
+} from "./resource-hints.js";
 
 export interface PanSouFetchInit {
   method: "POST";
@@ -98,22 +103,38 @@ export class PanSouResourceProvider implements ResourceProvider {
       }
     }
     const snapshotId = createSnapshotId(input.keyword, facts, input.workflowRunId);
-    const candidates: ResourceCandidate[] = facts.map((fact, index) => ({
-      id: `${snapshotId}_candidate_${index + 1}`,
-      snapshotId,
-      index,
-      title: fact.title,
-      type: fact.type,
-      source: fact.source,
-      episodeHints: extractEpisodeHints(fact.title),
-      qualityHints: extractQualityHints(fact.title),
-      providerPayload: {
-        url: fact.url,
-        password: fact.password,
-        datetime: fact.datetime,
-        rawType: fact.rawType,
-      },
-    }));
+
+    // Build candidates with transparency classification, then sort by transparency
+    // so that transparent (well-named) candidates appear first, followed by
+    // semi_transparent (compliance long titles) as fallback, and opaque last.
+    const candidates: ResourceCandidate[] = facts
+      .map((fact, index) => ({
+        id: `${snapshotId}_candidate_${index + 1}`,
+        snapshotId,
+        index,
+        title: fact.title,
+        type: fact.type,
+        source: fact.source,
+        episodeHints: extractEpisodeHints(fact.title),
+        qualityHints: extractQualityHints(fact.title),
+        providerPayload: {
+          url: fact.url,
+          password: fact.password,
+          datetime: fact.datetime,
+          rawType: fact.rawType,
+        },
+        _transparency: classifyCandidateTitle(fact.title).transparency,
+      }))
+      .sort((a, b) => {
+        const orderA = TRANSPARENCY_SORT_ORDER[a._transparency ?? "opaque"];
+        const orderB = TRANSPARENCY_SORT_ORDER[b._transparency ?? "opaque"];
+        return orderA - orderB;
+      })
+      .map((candidate, index) => {
+        // Remove internal _transparency field and reset index after sorting
+        const { _transparency, ...rest } = candidate;
+        return { ...rest, index };
+      });
 
     return {
       id: snapshotId,

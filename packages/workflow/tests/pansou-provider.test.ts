@@ -289,7 +289,10 @@ describe("PanSouResourceProvider", () => {
 
     // It kept polling past the partial first slice and surfaced BOTH links.
     expect(snapshot.candidates).toHaveLength(2);
-    expect(snapshot.candidates.map((c) => c.type)).toEqual(["115", "magnet"]);
+    // Candidates are now sorted by transparency:
+    // "Oppenheimer 2023 2160p" (scene release → transparent) comes first,
+    // "奥本海默 2023 (快取)" (non-standard → semi_transparent) comes second.
+    expect(snapshot.candidates.map((c) => c.type)).toEqual(["magnet", "115"]);
     // Stabilized at call 3 (count stopped growing) — did not burn all 5 attempts.
     expect(calls).toBe(3);
     expect(waits).toEqual([2500, 2500]);

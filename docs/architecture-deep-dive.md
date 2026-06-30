@@ -22,7 +22,7 @@
 | **数据库** | PostgreSQL 16 (托管于 Docker Compose) |
 | **队列/状态** | PG 表模拟 (无 Redis/外部队列) |
 | **ORM** | 无 — 原始 `pg` 连接 + SQL |
-| **测试** | Vitest v4 + Playwright |
+| **测试** | Vitest (TS, `vitest.config.ts`) + Python unittest (`tests/`) |
 | **部署** | Docker Compose (web + PG + PanSou 三容器) |
 | **网络穿透** | 可选 Cloudflare Tunnel |
 | **代理** | CF Worker 提供内置 TMDB 代理 (开箱即用) |
@@ -66,7 +66,7 @@ mediary-scout/
 │   └── tests/
 ├── workers/tmdb-proxy/     # CF Worker TMDB 代理
 ├── scripts/                # 运维脚本/调研探针 (30+个)
-├── tests/                  # Python E2E 测试
+├── tests/                  # Python 单元测试 (unittest: pan115/pansou/tmdb client、分页、DB)
 ├── docs/                   # 文档
 ├── references/             # SKILL 引用手册 (Agent 技能文档)
 ├── docker-compose.yml      # 自部署编排

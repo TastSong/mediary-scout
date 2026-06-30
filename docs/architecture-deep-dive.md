@@ -483,7 +483,7 @@ Agent 自主决策:
 ## 九、关键设计决策
 
 1. **进程内 Worker**: 单实例部署，worker 与 web server 同进程，`setInterval` 3s 轮询 PG 队列
-2. **PG 做队列**: 直接 `SELECT ... FOR UPDATE SKIP LOCKED` 做 claim，无需 Redis
+2. **PG 做队列**: claim 在一个事务内读取队列、用 `claimableQueuedRuns()` 内存过滤选出下一个、再 upsert 置为 running（`postgres.ts:377-397`，非 `SKIP LOCKED`），无需 Redis
 3. **Staging 暂存区**: 转存到暂存 → 核实 → 分发到季目录 → 清空暂存，避免直接污染目标库
 4. **搜索预算**: TV 最多 8 次 hard cap，Movie 8+2 弹性
 5. **Episode 代码系统**: `S01E01` 格式，Agent 通过文件名语义判断映射，不持久化 file→episode 映射
@@ -1512,7 +1512,7 @@ stateDiagram-v2
         waiting --> claimable: 时间到
     }
 
-    queued --> running: Worker claimNextQueuedWorkflowRun()<br/>(SELECT FOR UPDATE SKIP LOCKED)
+    queued --> running: Worker claimNextQueuedWorkflowRun()<br/>(事务内全量读 + claimableQueuedRuns 内存过滤 + upsert)
 
     state running {
         [*] --> agent_loop: 解析凭据 → 创建 Sandbox → generateText

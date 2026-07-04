@@ -850,4 +850,50 @@ export class TaskSandbox {
     }
     return { renamed, ...(errors.length > 0 ? { errors } : {}) };
   }
+
+  /** Verify ONE file's actual content is a real playable video by reading its
+   *  header bytes (magic-byte detection). Use this on suspicious files — a .mp4
+   *  that `inspectStaging` flagged with a "仅 X KB" note, or after a magnet
+   *  transfer where the file arrived quickly but might be a metadata shell. Each
+   *  probe costs 1–2 drive API calls — do NOT probe every file indiscriminately;
+   *  probe only the specific files you are unsure about (the ones with <10-20 MB
+   *  that you considered moving, or files from a suspect torrent). For files you
+   *  trust (hundreds of MB, transparent scene release name) probing is pure waste.
+   *
+   *  Returns a structured result the agent reads: {isPlayableVideo, format, note}.
+   *  A corrupted file returns isPlayableVideo:false with a note like "corrupted"
+   *  or "non-video content (HTML error page)" — the agent THEN deletes it and
+   *  searches for a replacement, never marks it obtained. */
+  async probeStagingVideo(input: {
+    fileId: string;
+  }): Promise<{ isPlayableVideo: boolean; format?: string; note: string }> {
+    if (!this.storage || !this.stagingDirectoryId) {
+      throw new Error("SANDBOX: no storage/staging handle configured");
+    }
+    const staging = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    const file = staging.find((f) => f.id === input.fileId);
+    if (!file) {
+      throw new Error(`SANDBOX_FILE_NOT_IN_STAGING: ${input.fileId} is not in this task's staging`);
+    }
+    let probeResult;
+    try {
+      probeResult = await this.storage.probeFileContent({
+        directoryId: this.stagingDirectoryId,
+        fileId: input.fileId,
+      });
+    } catch (error) {
+      // A thrown error is still a soft failure — convert to the probe shape
+      probeResult = {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `probe异常: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    const result: { isPlayableVideo: boolean; format?: string; note: string } = {
+      isPlayableVideo: probeResult.isPlayableVideo,
+      note: probeResult.note,
+    };
+    if (probeResult.format) result.format = probeResult.format;
+    return result;
+  }
 }

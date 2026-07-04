@@ -40,6 +40,7 @@ describe("buildSandboxToolSet — the agent's tool surface over the cage", () =>
         "inspectTargetDir",
         "markObtained",
         "moveToSeason",
+        "probeStagingVideo",
         "readSkill",
         "reportNoCoverage",
         "searchResources",

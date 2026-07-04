@@ -8,6 +8,18 @@
  * Built test-first, one capability at a time. No real 115, ever.
  */
 
+/** Result of probing a single file's content header to verify it IS a video. */
+export interface ProbeResult {
+  /** true = file header matches a known video container signature. */
+  isPlayableVideo: boolean;
+  /** Detected container format (from magic bytes), or undefined. */
+  format?: "mp4" | "mkv" | "avi" | "ts" | "webm" | "mov";
+  /** Bytes actually read from the file. */
+  bytesRead: number;
+  /** Human-readable diagnostic (pass/fail reason). */
+  note: string;
+}
+
 export interface SimTreeFile {
   /** Stable file id (provider file id analogue). */
   id: string;
@@ -18,6 +30,11 @@ export interface SimTreeFile {
   /** Extension hint: an external subtitle (§1.14) — kept with its video, never
    *  deleted as residue. (.sub/.idx are the VobSub pair.) */
   isSubtitle: boolean;
+  /** When the file looks suspicious — a .mp4 whose size is far below the video
+   *  threshold, or a probed file that failed header validation. Human-readable;
+   *  absent when the file is normal. The agent reads this to decide whether to
+   *  probe/debug/before marking obtained. */
+  note?: string;
 }
 
 export interface TransferAttemptResult {
@@ -51,6 +68,51 @@ interface File {
 const VIDEO_EXTENSIONS = /\.(mkv|mp4|avi|ts|m2ts|mov|flv|wmv)$/i;
 const SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|sub|idx|vtt|sup|smi)$/i;
 
+/** Minimum plausible video file size. Files with a video extension below this
+ *  threshold are still listed (the agent sees everything) but flagged with a
+ *  suspicious note so they are never silently treated as real episodes.
+ *  Default 0 (no filtering) in the simulator: tests use tiny sizes and must
+ *  pass unchanged. The real adapter (RealStorageV2) applies the 10 MB default
+ *  in production. To enable the filter in acceptance tests, pass minVideoSizeBytes
+ *  explicitly. */
+const DEFAULT_MIN_VIDEO_SIZE_BYTES = 0;
+
+/**
+ * Container-format magic-byte signatures for probeFileContent.
+ * Each entry is tested against the first bytes of the buffer.
+ */
+const VIDEO_MAGIC_SIGNATURES: Array<{ format: NonNullable<ProbeResult["format"]>; offset: number; bytes: number[] }> = [
+  { format: "mp4", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },                        // ...ftyp
+  { format: "mkv", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },                        // EBML
+  { format: "avi", offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] },                        // RIFF
+  { format: "ts", offset: 0, bytes: [0x47] },                                            // sync byte
+  { format: "webm", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },                       // EBML (same as mkv)
+  { format: "mov", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },                        // ...ftyp (same as mp4)
+];
+
+function detectVideoFormat(bytes: Uint8Array): { format?: ProbeResult["format"]; note: string } {
+  if (bytes.length < 12) {
+    return { note: "file too small to identify any video format" };
+  }
+
+  // Must NOT start with common non-video signatures
+  // HTML: <!DOCTYPE html / <html
+  if (
+    (bytes[0] === 0x3c && (bytes[1] === 0x21 || bytes[1] === 0x68)) || // <! or <h
+    bytes[0] === 0x7b  // { (JSON)
+  ) {
+    return { note: "non-video content detected (looks like HTML/JSON error page, not a video file)" };
+  }
+
+  for (const sig of VIDEO_MAGIC_SIGNATURES) {
+    if (sig.bytes.every((b, i) => bytes[sig.offset + i] === b)) {
+      return { format: sig.format, note: `valid ${sig.format} video header` };
+    }
+  }
+
+  return { note: "unrecognized file header — does not match any known video container format" };
+}
+
 /** The storage surface the sandbox depends on — the simulator and the real 115
  *  executor both satisfy it. */
 export interface StorageV2 {
@@ -82,6 +144,15 @@ export interface StorageV2 {
     filename: string;
     intoDirectoryId: string;
   }): Promise<TransferAttemptResult>;
+  /** Validate a single file's content by reading its header bytes (via a drive
+   *  download URL). Checks magic-byte signatures to confirm the file is genuinely
+   *  a playable video, not a corrupted placeholder / HTML error page / metadata
+   *  dump. Each cloud-drive brand implements its own fetch path (115: pickcode →
+   *  download API; quark/guangya: native download endpoint). When a drive has no
+   *  download capability, the result is a non-playable note — it never throws.
+   *  Cost: 1–2 drive API calls (download URL + Range fetch) per file — the agent
+   *  is taught to use this sparingly, only on suspicious files. */
+  probeFileContent(input: { directoryId: string; fileId: string }): Promise<ProbeResult>;
 }
 
 export class Storage115Simulator implements StorageV2 {
@@ -91,6 +162,9 @@ export class Storage115Simulator implements StorageV2 {
   private readonly linkKinds: Map<string, "pan115" | "magnet">;
   private readonly failureMessages: Map<string, string>;
   private readonly apiBudget: number;
+  private readonly corruptedFileIds = new Set<string>();
+  private readonly nonVideoFileIds = new Set<string>();
+  private readonly minVideoSizeBytes: number;
   private sequence = 0;
   private callsSpent = 0;
 
@@ -107,6 +181,16 @@ export class Storage115Simulator implements StorageV2 {
       failureMessages?: Record<string, string>;
       rootId?: string;
       apiBudget?: number;
+      /** File ids whose content is corrupted (probeFileContent returns isPlayableVideo:false).
+       *  Simulates user-uploaded damaged files — name/size normal, content broken. */
+      corruptedFileIds?: string[];
+      /** File ids whose content is NOT video (probeFileContent returns isPlayableVideo:false
+       *  with a "non-video" note — simulates HTML error pages / JSON responses saved as .mp4).
+       *  Semantically distinct from corrupted: the header is cleanly non-video. */
+      nonVideoFileIds?: string[];
+      /** Minimum size (in bytes) for a video-extension file to be tagged isVideo:true.
+       *  Defaults to 10 MB. Files below this threshold get isVideo:false + a note. */
+      minVideoSizeBytes?: number;
     } = {},
   ) {
     const rootId = options.rootId ?? "root";
@@ -115,6 +199,9 @@ export class Storage115Simulator implements StorageV2 {
     this.linkKinds = new Map(Object.entries(options.linkKinds ?? {}));
     this.failureMessages = new Map(Object.entries(options.failureMessages ?? {}));
     this.apiBudget = options.apiBudget ?? Number.POSITIVE_INFINITY;
+    this.minVideoSizeBytes = options.minVideoSizeBytes ?? DEFAULT_MIN_VIDEO_SIZE_BYTES;
+    for (const id of options.corruptedFileIds ?? []) this.corruptedFileIds.add(id);
+    for (const id of options.nonVideoFileIds ?? []) this.nonVideoFileIds.add(id);
   }
 
   candidateLinkKind(candidateId: string): "pan115" | "magnet" | "unknown" {
@@ -197,7 +284,22 @@ export class Storage115Simulator implements StorageV2 {
     return { status: "succeeded", materializedFileIds: [id] };
   }
 
-  /** Recursive, path-preserving snapshot of everything under a directory. */
+  /** Build the note for a file that looks suspicious based on size/ext mismatch. */
+  private suspiciousNote(file: File): string | undefined {
+    if (this.minVideoSizeBytes <= 0) return undefined;
+    const isVideoExt = VIDEO_EXTENSIONS.test(file.name);
+    if (!isVideoExt) return undefined;
+    if (file.sizeBytes < this.minVideoSizeBytes) {
+      const kb = Math.round(file.sizeBytes / 1024);
+      const mb = this.minVideoSizeBytes / (1024 * 1024);
+      return `⚠️ 仅 ${kb} KB,远低于正常视频下限 ${mb} MB — 可能是 HTML 错误页/空壳/样本,不是正片`;
+    }
+    return undefined;
+  }
+
+  /** Recursive, path-preserving snapshot of everything under a directory.
+   *  `isVideo` is gated by BOTH extension AND minimum size — a tiny .mp4 is
+   *  flagged as non-video (with a note) so the agent never treats it as an episode. */
   async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
     if (!this.dirs.has(input.directoryId)) {
       throw new Error(`SIM_DIR_NOT_FOUND: ${input.directoryId}`);
@@ -207,12 +309,15 @@ export class Storage115Simulator implements StorageV2 {
     const walk = (dirId: string, prefix: string): void => {
       for (const file of this.files.values()) {
         if (file.parentId === dirId) {
+          const isVideoByExt = VIDEO_EXTENSIONS.test(file.name);
+          const note = this.suspiciousNote(file);
           out.push({
             id: file.id,
             path: `${prefix}${file.name}`,
             sizeBytes: file.sizeBytes,
-            isVideo: VIDEO_EXTENSIONS.test(file.name),
+            isVideo: isVideoByExt && file.sizeBytes >= this.minVideoSizeBytes,
             isSubtitle: SUBTITLE_EXTENSIONS.test(file.name),
+            ...(note ? { note } : {}),
           });
         }
       }
@@ -224,6 +329,39 @@ export class Storage115Simulator implements StorageV2 {
     };
     walk(input.directoryId, "");
     return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /** Probe a file's content header — magic-byte validation against known video
+   *  container signatures. Simulates reading the first 4 KB of the file.
+   *  - normal file → returns the detected format (isPlayableVideo:true)
+   *  - corruptedFileIds member → corrupt with valid header note
+   *  - nonVideoFileIds member → non-video (HTML/JSON error page)
+   *  - unknown file → return the non-playable detection */
+  async probeFileContent(input: { directoryId: string; fileId: string }): Promise<ProbeResult> {
+    this.spendBudget(1);
+    const file = this.files.get(input.fileId);
+    if (!file) {
+      throw new Error(`SIM_FILE_NOT_FOUND: ${input.fileId} (in probeFileContent)`);
+    }
+    if (this.corruptedFileIds.has(input.fileId)) {
+      return { isPlayableVideo: false, bytesRead: 4096, note: "corrupted: file header contains random/zeroed bytes, not a valid video container" };
+    }
+    if (this.nonVideoFileIds.has(input.fileId)) {
+      return { isPlayableVideo: false, bytesRead: 4096, note: "non-video content detected (looks like HTML/JSON error page, not a video file)" };
+    }
+    if (VIDEO_EXTENSIONS.test(file.name)) {
+      const fmt = file.name.endsWith(".mp4") ? "mp4"
+        : file.name.endsWith(".mkv") ? "mkv"
+        : file.name.endsWith(".avi") ? "avi"
+        : file.name.endsWith(".ts") ? "ts"
+        : file.name.endsWith(".webm") ? "webm"
+        : file.name.endsWith(".mov") ? "mov"
+        : undefined;
+      const result: ProbeResult = { isPlayableVideo: true, bytesRead: 4096, note: "valid video header" };
+      if (fmt) result.format = fmt;
+      return result;
+    }
+    return { isPlayableVideo: false, bytesRead: 4096, note: "not a recognized video format" };
   }
 
   /** Move files (by id) into a target directory. 115 never overwrites: a name

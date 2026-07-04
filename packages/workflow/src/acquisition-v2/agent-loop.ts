@@ -171,6 +171,12 @@ export function buildSandboxToolSet(
       inputSchema: z.object({}),
       execute: () => asEvidence(() => sandbox.discardStaging()),
     },
+    probeStagingVideo: {
+      description:
+        "One-off diagnostic: read the actual CONTENT header of ONE staging file (by id) to verify it IS a real playable video, not a corrupted placeholder / HTML error page / JSON error response saved as .mp4. This costs 1–2 drive API calls per file — use it SPARINGLY, only on files inspectStaging flagged as suspicious (size far below 10 MB, or from a suspect source). For a normal-looking several-hundred-MB file, do NOT probe — trust it. Returns {isPlayableVideo, format?, note}.",
+      inputSchema: z.object({ fileId: z.string() }),
+      execute: (args: { fileId: string }) => asEvidence(() => sandbox.probeStagingVideo(args)),
+    },
     markObtained: {
       description:
         "Your FINAL action: declare the episode codes you have obtained (e.g. [\"S01E13\"], or [\"MOVIE\"] for a film). Do this LAST — only after you have moved the files into the target dir, flattened the wrapper, and confirmed from your inspect that the real films are in place. Pure agent judgment: no fileId, the system does not re-read to second-guess you. MOVIE last-resort fallback: if you landed a raw-name match of the correct film WITHOUT a confirmed 中文 sub track (中字 budget exhausted), pass subtitleFallback:true so the system flags 可能无中文字幕.",

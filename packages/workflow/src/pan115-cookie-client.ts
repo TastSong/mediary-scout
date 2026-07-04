@@ -289,6 +289,32 @@ export class Pan115CookieClient implements Pan115StorageApi {
     return actionResultFromResponse(response);
   }
 
+  /** Get a direct download URL for a file by pickcode. 115's proapi appendix
+   *  endpoint resolves a pickcode to a time-limited download URL. The URL is
+   *  valid for a short window (~minutes) — callers should use it immediately
+   *  (e.g. a Range request for the first few KB). */
+  async getDownloadUrl(pickcode: string): Promise<string> {
+    const response = await this.getJson(`${PAN115_WEBAPI_BASE_URL}/files/download`, [
+      ["pickcode", pickcode],
+    ]);
+    if (!isRecord(response)) {
+      throw new Error("PAN115_DOWNLOAD_URL_FAILED: unexpected response shape");
+    }
+    const url = stringValue(
+      recordValue(response, "file_url") ??
+        recordValue(response, "url") ??
+        recordValue(recordValue(response, "data"), "url") ??
+        recordValue(response, "download_url") ??
+        recordValue(response, "down_url"),
+    );
+    if (!url) {
+      throw new Error(
+        `PAN115_DOWNLOAD_URL_FAILED: no url in response for pickcode=${pickcode} — ${responseMessage(response)}`,
+      );
+    }
+    return url;
+  }
+
   private async getJson(url: string, params: Array<[string, string]>): Promise<unknown> {
     const query = new URLSearchParams(params);
     return this.fetchJson(`${url}?${query.toString()}`, {

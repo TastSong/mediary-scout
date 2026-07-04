@@ -7,6 +7,7 @@ import type {
 } from "./domain.js";
 import { episodeCodeFromFileName } from "./episode-code.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
+import type { ProbeResult } from "./acquisition-v2/storage-115-simulator.js";
 
 /**
  * Depth bound for the recursive video collectors, matching listTree's default.
@@ -54,6 +55,10 @@ export interface Pan115Item {
   size?: string | number;
   s?: string | number;
   fc?: string | number;
+  /** 115 pickcode — the stable file-download key. `pc` on a file row;
+   *  absent on directories. Needed for probeFileContent. */
+  pc?: string;
+  pick_code?: string;
   isDirectory?: boolean;
 }
 
@@ -101,6 +106,9 @@ export interface Pan115StorageApi {
   moveItems(input: { fileIds: string[]; targetDirectoryId: string }): Promise<Pan115ActionResult>;
   deleteItems(input: { fileIds: string[] }): Promise<Pan115ActionResult>;
   renameFile(input: { fileId: string; newName: string }): Promise<Pan115ActionResult>;
+  /** Get a time-limited direct download URL for a file by its pickcode. Used by
+   *  probeFileContent to read the first few KB and verify the file IS a video. */
+  getDownloadUrl(pickcode: string): Promise<string>;
 }
 
 export interface Storage115ExecutorOptions {
@@ -1044,6 +1052,111 @@ export class Storage115Executor implements StorageExecutor {
   private async callApi<T>(operation: Pan115Operation, call: () => Promise<T>): Promise<T> {
     return this.apiGuard.run(operation, call);
   }
+
+  /**
+   * Probe a file's content header to verify it IS a real playable video.
+   *
+   * Resolution: items from listItems carry a `pc` (pickcode) field. We resolve
+   * it to a direct download URL via the 115 proapi appendix, then issue ONE
+   * Range request (bytes 0-4095) to read the first 4 KB. Magic-byte detection
+   * on those bytes tells us whether this is a genuine video container or a
+   * corrupted/HTML/JSON error page saved under a .mp4 name.
+   *
+   * Cost: 2 calls — one `/files/download` (get url) + one Range fetch.
+   * The download URL is time-limited (~minutes) so we use it immediately.
+   */
+  async probeFileContent(input: { directoryId: string; fileId: string }): Promise<ProbeResult> {
+    // We need the file's pickcode from a listItems call — but listItems returns
+    // all items in a directory page, and probeFileContent only has fileId.
+    // fileId on 115 IS the fid — so we need ONE list call scoped to the dir
+    // to resolve the item and read its pickcode. This costs 1 API call.
+    const items = await this.callApi("listItems", () => this.api.listItems({ directoryId: input.directoryId }));
+    const item = items.find((item) => fileIdFromItem(item) === input.fileId);
+    if (!item || isDirectory(item)) {
+      return { isPlayableVideo: false, bytesRead: 0, note: `file ${input.fileId} not found in directory listing` };
+    }
+
+    const pickcode = stringValue(item.pc ?? item.pick_code);
+    if (!pickcode) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: "115 file has no pickcode — cannot get download URL to verify content (可能是目录或未完成上传的文件)",
+      };
+    }
+
+    let downloadUrl: string;
+    try {
+      downloadUrl = await this.api.getDownloadUrl(pickcode);
+    } catch (error) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `获取下载链接失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    try {
+      const response = await fetch(downloadUrl, {
+        headers: { Range: "bytes=0-4095" },
+        signal: AbortSignal.timeout?.(8000) ?? undefined,
+      });
+      if (!response.ok && response.status !== 206) {
+        return { isPlayableVideo: false, bytesRead: 0, note: `download URL returned HTTP ${response.status}` };
+      }
+      const buf = new Uint8Array(await response.arrayBuffer());
+      const detected = detectVideoFormat(buf);
+      const result: ProbeResult = {
+        isPlayableVideo: detected.format !== undefined,
+        bytesRead: buf.length,
+        note: detected.note,
+      };
+      if (detected.format) result.format = detected.format;
+      return result;
+    } catch (error) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `读取文件头失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+}
+
+/**
+ * Container-format magic-byte signatures for probeFileContent.
+ * Each entry is tested against the given offset in the buffer.
+ * Shared between the real executor and the simulator so detection is consistent.
+ */
+const VIDEO_MAGIC_SIGNATURES: Array<{ format: NonNullable<ProbeResult["format"]>; offset: number; bytes: number[] }> = [
+  { format: "mp4", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },
+  { format: "mkv", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },
+  { format: "avi", offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] },
+  { format: "ts", offset: 0, bytes: [0x47] },
+  { format: "webm", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },
+  { format: "mov", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },
+];
+
+function detectVideoFormat(bytes: Uint8Array): { format?: ProbeResult["format"]; note: string } {
+  if (bytes.length < 12) {
+    return { note: "文件太小，无法识别任何视频格式" };
+  }
+
+  // Must NOT start with common non-video signatures: HTML or JSON
+  if (
+    (bytes[0] === 0x3c && (bytes[1] === 0x21 || bytes[1] === 0x68)) ||
+    bytes[0] === 0x7b
+  ) {
+    return { note: "检测到非视频内容（疑似 HTML/JSON 错误页面，不是视频文件）" };
+  }
+
+  for (const sig of VIDEO_MAGIC_SIGNATURES) {
+    if (sig.bytes.every((b, i) => bytes[sig.offset + i] === b)) {
+      return { format: sig.format, note: `确认为 ${sig.format} 格式视频文件，头签名合法` };
+    }
+  }
+
+  return { note: "无法识别的文件头，不匹配任何已知视频容器格式" };
 }
 
 export function createProtectedStorage115Executor(

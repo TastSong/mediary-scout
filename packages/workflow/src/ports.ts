@@ -5,6 +5,7 @@ import type {
   TransferAttempt,
   VerifiedFile,
 } from "./domain.js";
+import type { ProbeResult } from "./acquisition-v2/storage-115-simulator.js";
 
 export interface ResourceProvider {
   /**
@@ -72,4 +73,10 @@ export interface StorageExecutor {
     directoryId: string;
     workflowRunId: string;
   }): Promise<TransferAttempt>;
+  /** Validate a single file's header content (magic bytes) to confirm it is a
+   *  real playable video. Reads the first 4–16 KB of the file via a Range
+   *  request over the drive's download endpoint. Optional — when absent, the
+   *  sandbox tool is still registered but always returns a soft-fail (no probe
+   *  capability) so the agent never crashes on unimplemented drives. */
+  probeFileContent?(input: { directoryId: string; fileId: string }): Promise<ProbeResult>;
 }

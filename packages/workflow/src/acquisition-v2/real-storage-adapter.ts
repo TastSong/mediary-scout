@@ -2,7 +2,7 @@ import type { TransferAttempt } from "../domain.js";
 import type { StorageExecutor } from "../ports.js";
 import type { CandidateRegistry } from "./candidate-registry.js";
 import { deadLinkKey, deadLinkReason, UNRESOLVED_MAGNET_DEAD_LINK_TTL_MS, type DeadLinkStore } from "./dead-links.js";
-import type { SimTreeFile, StorageV2, TransferAttemptResult } from "./storage-115-simulator.js";
+import type { ProbeResult, SimTreeFile, StorageV2, TransferAttemptResult } from "./storage-115-simulator.js";
 
 /**
  * Phase 6 — the real 115 executor as a StorageV2. It maps the V2 sandbox's tool
@@ -21,6 +21,10 @@ export interface RealStorageV2Options {
   /** When set, a transfer PROVEN dead (115 fail-loud / magnet-no-秒传) records the
    *  link so future PanSou searches filter it out before the agent sees it (#15). */
   deadLinkStore?: DeadLinkStore;
+  /** Minimum plausible video file size (default 10 MB). `listTree` uses this to
+   *  suppress `isVideo` for video-extension files below the threshold, and to
+   *  attach a suspicious note the agent can read. */
+  minVideoSizeBytes?: number;
 }
 
 export class RealStorageV2 implements StorageV2 {
@@ -28,6 +32,7 @@ export class RealStorageV2 implements StorageV2 {
   private readonly registry: CandidateRegistry;
   private readonly workflowRunId: string;
   private readonly deadLinkStore: DeadLinkStore | undefined;
+  private readonly minVideoSizeBytes: number;
   private readonly recordedAttempts: TransferAttempt[] = [];
 
   constructor(options: RealStorageV2Options) {
@@ -35,6 +40,7 @@ export class RealStorageV2 implements StorageV2 {
     this.registry = options.registry;
     this.workflowRunId = options.workflowRunId;
     this.deadLinkStore = options.deadLinkStore;
+    this.minVideoSizeBytes = options.minVideoSizeBytes ?? 10 * 1024 * 1024; // 10 MB
   }
 
   /** Every transfer attempt this run, for the workflow to persist. */
@@ -144,13 +150,24 @@ export class RealStorageV2 implements StorageV2 {
 
   async listTree(input: { directoryId: string }): Promise<SimTreeFile[]> {
     const tree = await this.executor.listTree({ directoryId: input.directoryId });
-    return tree.map((file) => ({
-      id: file.providerFileId,
-      path: file.path,
-      sizeBytes: file.sizeBytes,
-      isVideo: VIDEO_EXTENSIONS.test(file.path),
-      isSubtitle: SUBTITLE_EXTENSIONS.test(file.path),
-    }));
+    return tree.map((file) => {
+      const isVideoByExt = VIDEO_EXTENSIONS.test(file.path);
+      const isVideo = isVideoByExt && file.sizeBytes >= this.minVideoSizeBytes;
+      let note: string | undefined;
+      if (isVideoByExt && file.sizeBytes < this.minVideoSizeBytes) {
+        const kb = Math.round(file.sizeBytes / 1024);
+        const mb = this.minVideoSizeBytes / (1024 * 1024);
+        note = `⚠️ 仅 ${kb} KB,远低于正常视频下限 ${mb} MB — 可能是 HTML 错误页/空壳/样本`;
+      }
+      return {
+        id: file.providerFileId,
+        path: file.path,
+        sizeBytes: file.sizeBytes,
+        isVideo,
+        isSubtitle: SUBTITLE_EXTENSIONS.test(file.path),
+        ...(note ? { note } : {}),
+      };
+    });
   }
 
   async listSubdirectories(input: { directoryId: string }): Promise<Array<{ id: string; path: string }>> {
@@ -172,5 +189,28 @@ export class RealStorageV2 implements StorageV2 {
   async removeDirectory(input: { directoryId: string }): Promise<{ removed: string[] }> {
     const result = await this.executor.removeDirectory(input.directoryId);
     return { removed: result.removed ? [input.directoryId] : [] };
+  }
+
+  /** Probe a file's content header to verify it IS a real video. Delegates to
+   *  the executor's optional probeFileContent — when the drive hasn't implemented
+   *  it, returns a soft non-playable result (never throws) so the agent's tool
+   *  always works and only fails meaningfully. */
+  async probeFileContent(input: { directoryId: string; fileId: string }): Promise<ProbeResult> {
+    if (!this.executor.probeFileContent) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: "此网盘暂不支持文件内容探测(缺少 download URL API)——无法验证文件是否可播放",
+      };
+    }
+    try {
+      return await this.executor.probeFileContent({ directoryId: input.directoryId, fileId: input.fileId });
+    } catch (error) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 }

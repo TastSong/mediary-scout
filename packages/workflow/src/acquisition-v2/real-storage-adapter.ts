@@ -40,7 +40,7 @@ export class RealStorageV2 implements StorageV2 {
     this.registry = options.registry;
     this.workflowRunId = options.workflowRunId;
     this.deadLinkStore = options.deadLinkStore;
-    this.minVideoSizeBytes = options.minVideoSizeBytes ?? 10 * 1024 * 1024; // 10 MB
+    this.minVideoSizeBytes = options.minVideoSizeBytes ?? 0;
   }
 
   /** Every transfer attempt this run, for the workflow to persist. */

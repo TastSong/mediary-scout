@@ -260,6 +260,29 @@ export class QuarkCookieClient {
     unwrap(response, "QUARK_RENAME_FAILED");
   }
 
+  /** Resolve a file fid to a time-limited direct download URL. Quark's download
+   *  endpoint returns a redirect-capable URL valid for ~15 minutes. The caller
+   *  should use the URL immediately (e.g. a Range request for the first 4 KB). */
+  async getDownloadUrl(fid: string): Promise<string> {
+    const response = await this.postJson("/1/clouddrive/file/download", { fids: [fid] });
+    const data = unwrap(response, "QUARK_DOWNLOAD_URL_FAILED");
+    // Response is an array of {fid, download_url} — find the one for our fid.
+    const items = arrayValue(data);
+    for (const item of items.filter(isRecord)) {
+      const itemFid = stringValue(recordValue(item, "fid"));
+      if (itemFid === fid) {
+        const url = stringValue(recordValue(item, "download_url") ?? recordValue(item, "downloadUrl"));
+        if (url) return url;
+      }
+    }
+    // Fallback: single-object response shape
+    const single = stringValue(
+      recordValue(data, "download_url") ?? recordValue(data, "downloadUrl") ?? recordValue(data, "url"),
+    );
+    if (single) return single;
+    throw new Error(`QUARK_DOWNLOAD_URL_FAILED: no url in response for fid=${fid}`);
+  }
+
   private async getJson(path: string, params: Array<[string, string]>): Promise<unknown> {
     const query = new URLSearchParams(QUARK_BASE_QUERY);
     for (const [key, value] of params) {

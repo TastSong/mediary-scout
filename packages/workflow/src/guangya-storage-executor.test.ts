@@ -15,6 +15,7 @@ function fakeClient(overrides: Partial<GuangYaStorageClient> = {}): GuangYaStora
     resolveRes: vi.fn(async () => ({ resType: 1 })),
     createTask: vi.fn(async () => "task-1"),
     listTask: vi.fn(async () => [{ taskId: "task-1", status: 2, progress: 100, fileId: "" }]),
+    getDownloadUrl: vi.fn(async () => "https://guangya.example.com/dl/signed"),
     ...overrides,
   };
 }

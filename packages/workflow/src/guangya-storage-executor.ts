@@ -26,6 +26,7 @@ import { episodeCodeFromFileName } from "./episode-code.js";
 import { isGuangYaAuthError } from "./guangya-client.js";
 import type { GuangYaResolvedRes, GuangYaTaskStatus } from "./guangya-client.js";
 import type { StorageExecutor, UnparsedVideoFile } from "./ports.js";
+import type { ProbeResult } from "./acquisition-v2/storage-115-simulator.js";
 
 const MAX_RECURSIVE_COLLECT_DEPTH = 6;
 const DEFAULT_MIN_VIDEO_SIZE_BYTES = 10 * 1024 * 1024;
@@ -74,6 +75,9 @@ export interface GuangYaStorageClient {
     fileIndexes?: number[];
   }): Promise<string>;
   listTask(taskIds: string[]): Promise<GuangYaTaskStatus[]>;
+  /** Get a time-limited direct download URL for a file by its fileId. Used by
+   *  probeFileContent to read the first few KB and verify the file IS a video. */
+  getDownloadUrl(fileId: string): Promise<string>;
 }
 
 export interface GuangYaStorageExecutorOptions {
@@ -640,6 +644,52 @@ export class GuangYaStorageExecutor implements StorageExecutor {
       `WRITE_SCOPE_VIOLATION: refusing to ${action} outside configured write scope; fileId=${normalized}`,
     );
   }
+
+  /**
+   * Probe a file's content header to verify it IS a real playable video.
+   *
+   * Resolution: resolve the 光鸭 fileId to a download URL via
+   * `get_download_url`, then issue ONE Range request for the first 4 KB.
+   *
+   * Cost: 2 calls — one get_download_url + one Range fetch.
+   */
+  async probeFileContent(input: { directoryId: string; fileId: string }): Promise<ProbeResult> {
+    let downloadUrl: string;
+    try {
+      downloadUrl = await this.client.getDownloadUrl(input.fileId);
+    } catch (error) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `获取下载链接失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    try {
+      const response = await fetch(downloadUrl, {
+        headers: { Range: "bytes=0-4095" },
+        signal: AbortSignal.timeout?.(8000) ?? undefined,
+      });
+      if (!response.ok && response.status !== 206) {
+        return { isPlayableVideo: false, bytesRead: 0, note: `download URL returned HTTP ${response.status}` };
+      }
+      const buf = new Uint8Array(await response.arrayBuffer());
+      const detected = detectVideoFormat(buf);
+      const result: ProbeResult = {
+        isPlayableVideo: detected.format !== undefined,
+        bytesRead: buf.length,
+        note: detected.note,
+      };
+      if (detected.format) result.format = detected.format;
+      return result;
+    } catch (error) {
+      return {
+        isPlayableVideo: false,
+        bytesRead: 0,
+        note: `读取文件头失败: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
 }
 
 function verifiedFileFromItem(
@@ -684,6 +734,34 @@ function sizeOf(item: GuangYaStorageItem): number {
 function isVideoName(name: string, videoExtensions: Set<string>): boolean {
   const lower = name.toLowerCase();
   return [...videoExtensions].some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Container-format magic-byte signatures for probeFileContent.
+ * Detects valid video containers vs HTML/JSON error pages vs corrupted data.
+ * Shared signature table — 光鸭 transmits these over the wire; the same bytes
+ * appear in 115 and quark executors so detection is consistent across drives.
+ */
+const VIDEO_MAGIC_SIGNATURES: Array<{ format: NonNullable<ProbeResult["format"]>; offset: number; bytes: number[] }> = [
+  { format: "mp4", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },
+  { format: "mkv", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },
+  { format: "avi", offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] },
+  { format: "ts", offset: 0, bytes: [0x47] },
+  { format: "webm", offset: 0, bytes: [0x1a, 0x45, 0xdf, 0xa3] },
+  { format: "mov", offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] },
+];
+
+function detectVideoFormat(bytes: Uint8Array): { format?: ProbeResult["format"]; note: string } {
+  if (bytes.length < 12) return { note: "文件太小，无法识别任何视频格式" };
+  if ((bytes[0] === 0x3c && (bytes[1] === 0x21 || bytes[1] === 0x68)) || bytes[0] === 0x7b) {
+    return { note: "检测到非视频内容(疑似 HTML/JSON 错误页面，不是视频文件)" };
+  }
+  for (const sig of VIDEO_MAGIC_SIGNATURES) {
+    if (sig.bytes.every((b, i) => bytes[sig.offset + i] === b)) {
+      return { format: sig.format, note: `确认为 ${sig.format} 格式视频文件，头签名合法` };
+    }
+  }
+  return { note: "无法识别的文件头，不匹配任何已知视频容器格式" };
 }
 
 function normalizeId(directoryId: string): string {

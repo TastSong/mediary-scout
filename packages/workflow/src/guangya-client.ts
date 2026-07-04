@@ -238,6 +238,18 @@ export class GuangYaClient {
     return arrayValue(recordValue(data, "list")).filter(isRecord).map(toTaskStatus);
   }
 
+  /** Resolve a fileId to a time-limited direct download URL. 光鸭's download
+   *  endpoint generates a signed URL valid for a short window. The caller should
+   *  use it immediately (e.g. a Range fetch for the first few KB). */
+  async getDownloadUrl(fileId: string): Promise<string> {
+    const data = await this.postAPI("/nd.bizuserres.s/v1/file/get_download_url", { fileId });
+    const url = stringValue(recordValue(data, "downloadUrl") ?? recordValue(data, "url"));
+    if (!url) {
+      throw new Error(`GUANGYA_DOWNLOAD_URL_FAILED: no url for fileId=${fileId}`);
+    }
+    return url;
+  }
+
   /**
    * POST to the api host with Bearer + Did + Dt:4. On 401 (once) refresh and
    * retry. Success = `msg===""||msg==="success"`; otherwise throw (GuangYaAuthError

@@ -1,14 +1,19 @@
 import { describe, it, expect } from "vitest";
+import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import {
   createMemoryConnectDb,
   createD1ConnectDb,
   type D1Database,
   type D1PreparedStatement,
+  type ConnectDb,
   type InviteRow,
   type EndpointRow,
   type AuditRow,
   type EntitlementRow,
   type PaymentOrderRow,
+  type InstanceLinkRequestRow,
+  type InstanceCredentialRow,
 } from "./db.js";
 
 function makeInvite(overrides: Partial<InviteRow> = {}): InviteRow {
@@ -42,7 +47,38 @@ function makeEndpoint(overrides: Partial<EndpointRow> = {}): EndpointRow {
     token_shown_at: null,
     last_seen_at: null,
     created_at: "2026-07-24T00:00:00.000Z",
-    revoked_at: null, account_id: null, grace_until: null, suspended_at: null, purge_after: null,
+    revoked_at: null, account_id: null, grace_until: null, suspended_at: null, purge_after: null, revoke_reason: null,
+    ...overrides,
+  };
+}
+
+function makeInstanceLinkRequest(overrides: Partial<InstanceLinkRequestRow> = {}): InstanceLinkRequestRow {
+  return {
+    id: "ilr_1",
+    poll_secret_sha256: "poll-sha-1",
+    email: "alice@example.com",
+    verify_code: "AB23",
+    status: "pending",
+    account_id: null,
+    request_ip: "192.0.2.1",
+    created_at: "2026-10-03T00:00:00.000Z",
+    expires_at: "2026-10-03T00:30:00.000Z",
+    approved_at: null,
+    delivered_at: null,
+    last_polled_at: null,
+    ...overrides,
+  };
+}
+
+function makeInstanceCredential(overrides: Partial<InstanceCredentialRow> = {}): InstanceCredentialRow {
+  return {
+    id: "icr_1",
+    account_id: "act_1",
+    credential_sha256: "credential-sha-1",
+    link_request_id: "ilr_1",
+    created_at: "2026-10-03T00:01:00.000Z",
+    last_used_at: null,
+    revoked_at: null,
     ...overrides,
   };
 }
@@ -138,7 +174,7 @@ describe("memory ConnectDb", () => {
         makeEndpoint({ id: "ep_2", invite_id: null, slug: "s2", hostname: "s2.x", account_id: "act_1" }),
       ),
     ).rejects.toThrow(/UNIQUE constraint failed: endpoints\.account_id/);
-    await db.markEndpointRevoked("ep_1", "2026-07-28T03:00:00.000Z");
+    await db.markEndpointRevoked("ep_1", "2026-07-28T03:00:00.000Z", "expired");
     await db.insertEndpoint(
       makeEndpoint({ id: "ep_3", invite_id: null, slug: "s3", hostname: "s3.x", account_id: "act_1" }),
     );
@@ -148,7 +184,7 @@ describe("memory ConnectDb", () => {
   it("markEndpointRevoked sets status revoked and revoked_at", async () => {
     const db = createMemoryConnectDb();
     await db.insertEndpoint(makeEndpoint());
-    await db.markEndpointRevoked("ep_1", "2026-07-24T03:00:00.000Z");
+    await db.markEndpointRevoked("ep_1", "2026-07-24T03:00:00.000Z", "expired");
     const row = await db.getEndpointById("ep_1");
     expect(row?.status).toBe("revoked");
     expect(row?.revoked_at).toBe("2026-07-24T03:00:00.000Z");
@@ -157,10 +193,297 @@ describe("memory ConnectDb", () => {
   it("markEndpointRevokeFailed sets status revoke_failed", async () => {
     const db = createMemoryConnectDb();
     await db.insertEndpoint(makeEndpoint());
-    await db.markEndpointRevokeFailed("ep_1");
+    await db.markEndpointRevokeFailed("ep_1", "expired");
     const row = await db.getEndpointById("ep_1");
     expect(row?.status).toBe("revoke_failed");
     expect(row?.revoked_at).toBeNull();
+  });
+
+  it("markEndpointRevoked records the reason, and markEndpointRevokeFailed too", async () => {
+    const db = createMemoryConnectDb();
+    const at = "2026-07-24T03:00:00.000Z";
+    await db.insertEndpoint(makeEndpoint({ id: "ep_1", revoke_reason: null }));
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_2",
+        invite_id: "inv_2",
+        slug: "bob",
+        hostname: "bob.connect.example.com",
+        revoke_reason: null,
+      }),
+    );
+    await db.markEndpointRevoked("ep_1", at, "expired");
+    const revoked = await db.getEndpointById("ep_1");
+    expect(revoked?.status).toBe("revoked");
+    expect(revoked?.revoked_at).toBe(at);
+    expect(revoked?.revoke_reason).toBe("expired");
+    await db.markEndpointRevokeFailed("ep_2", "refunded");
+    const failed = await db.getEndpointById("ep_2");
+    expect(failed?.status).toBe("revoke_failed");
+    expect(failed?.revoke_reason).toBe("refunded");
+  });
+
+  it("getRestorableEndpointByAccountId returns the account's newest row only when it was expired or refunded", async () => {
+    const db = createMemoryConnectDb();
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_a_old",
+        invite_id: null,
+        slug: "a-old",
+        hostname: "a-old.example",
+        account_id: "act_a",
+        status: "revoked",
+        revoke_reason: "expired",
+        created_at: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_a_new",
+        invite_id: null,
+        slug: "a-new",
+        hostname: "a-new.example",
+        account_id: "act_a",
+        status: "revoked",
+        revoke_reason: "admin",
+        created_at: "2026-05-01T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_b",
+        invite_id: null,
+        slug: "b",
+        hostname: "b.example",
+        account_id: "act_b",
+        status: "revoked",
+        revoke_reason: "expired",
+        created_at: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_c",
+        invite_id: null,
+        slug: "c",
+        hostname: "c.example",
+        account_id: "act_c",
+        status: "revoke_failed",
+        revoke_reason: "refunded",
+        created_at: "2026-04-01T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_d",
+        invite_id: null,
+        slug: "d",
+        hostname: "d.example",
+        account_id: "act_d",
+        status: "revoked",
+        revoke_reason: null,
+        created_at: "2026-02-01T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_e_dead",
+        invite_id: null,
+        slug: "e-dead",
+        hostname: "e-dead.example",
+        account_id: "act_e",
+        status: "revoked",
+        revoke_reason: "expired",
+        created_at: "2026-01-15T00:00:00.000Z",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_e_live",
+        invite_id: null,
+        slug: "e-live",
+        hostname: "e-live.example",
+        account_id: "act_e",
+        status: "active",
+        revoke_reason: null,
+        created_at: "2026-06-01T00:00:00.000Z",
+      }),
+    );
+
+    expect(await db.getRestorableEndpointByAccountId("act_a")).toBeNull();
+    expect((await db.getRestorableEndpointByAccountId("act_b"))?.id).toBe("ep_b");
+    expect((await db.getRestorableEndpointByAccountId("act_c"))?.id).toBe("ep_c");
+    expect(await db.getRestorableEndpointByAccountId("act_d")).toBeNull();
+    expect(await db.getRestorableEndpointByAccountId("act_e")).toBeNull();
+  });
+
+  it("reactivateEndpoint flips only a revoked row of that account and clears the revoke fields", async () => {
+    const db = createMemoryConnectDb();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_1",
+        invite_id: null,
+        slug: "fam",
+        hostname: "fam.mediaryconnect.app",
+        account_id: "act_1",
+        status: "revoked",
+        revoke_reason: "expired",
+        revoked_at: "2026-06-01T00:00:00.000Z",
+        last_seen_at: "2026-05-01T00:00:00.000Z",
+        token_ciphertext: "cipher",
+        token_shown_at: "2026-04-01T00:00:00.000Z",
+        cf_access_app_id: "app_old",
+        cf_access_policy_id: "pol_old",
+        created_at: createdAt,
+      }),
+    );
+    expect(
+      await db.reactivateEndpoint({
+        id: "ep_1",
+        accountId: "act_1",
+        cfTunnelId: "t2",
+        cfDnsRecordId: "r2",
+        tokenSha256: "s2",
+      }),
+    ).toBe(true);
+    const row = await db.getEndpointById("ep_1");
+    expect(row).toMatchObject({
+      status: "active",
+      cf_tunnel_id: "t2",
+      cf_dns_record_id: "r2",
+      token_sha256: "s2",
+      revoked_at: null,
+      revoke_reason: null,
+      last_seen_at: null,
+      token_ciphertext: null,
+      token_shown_at: null,
+      cf_access_app_id: null,
+      cf_access_policy_id: null,
+      slug: "fam",
+      hostname: "fam.mediaryconnect.app",
+      created_at: createdAt,
+    });
+    expect(
+      await db.reactivateEndpoint({
+        id: "ep_1",
+        accountId: "act_1",
+        cfTunnelId: "t3",
+        cfDnsRecordId: "r3",
+        tokenSha256: "s3",
+      }),
+    ).toBe(false);
+    expect((await db.getEndpointById("ep_1"))?.cf_tunnel_id).toBe("t2");
+    expect(
+      await db.reactivateEndpoint({
+        id: "ep_1",
+        accountId: "act_other",
+        cfTunnelId: "t4",
+        cfDnsRecordId: "r4",
+        tokenSha256: "s4",
+      }),
+    ).toBe(false);
+    expect(await db.reactivateEndpoint({
+      id: "missing",
+      accountId: "act_1",
+      cfTunnelId: "t5",
+      cfDnsRecordId: "r5",
+      tokenSha256: "s5",
+    })).toBe(false);
+  });
+
+  it("reactivateEndpoint cannot create a second live row for the account", async () => {
+    const db = createMemoryConnectDb();
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_live",
+        invite_id: null,
+        slug: "live",
+        hostname: "live.example",
+        account_id: "act_1",
+        status: "active",
+        revoke_reason: null,
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_dead",
+        invite_id: null,
+        slug: "dead",
+        hostname: "dead.example",
+        account_id: "act_1",
+        status: "revoked",
+        revoke_reason: "expired",
+      }),
+    );
+    expect(
+      await db.reactivateEndpoint({
+        id: "ep_dead",
+        accountId: "act_1",
+        cfTunnelId: "t2",
+        cfDnsRecordId: "r2",
+        tokenSha256: "s2",
+      }),
+    ).toBe(false);
+    expect((await db.getEndpointById("ep_dead"))?.status).toBe("revoked");
+  });
+
+  it("finishFailedRevoke flips only the captured revoke_failed row", async () => {
+    const db = createMemoryConnectDb();
+    const at = "2026-10-04T00:00:00.000Z";
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_fail",
+        invite_id: null,
+        slug: "fail",
+        hostname: "fail.example",
+        account_id: "act_1",
+        status: "revoke_failed",
+        revoke_reason: "refunded",
+        revoked_at: null,
+        cf_tunnel_id: "t-old",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_live",
+        invite_id: null,
+        slug: "live",
+        hostname: "live.example",
+        account_id: "act_2",
+        status: "active",
+        revoke_reason: null,
+        cf_tunnel_id: "t-live",
+      }),
+    );
+    await db.insertEndpoint(
+      makeEndpoint({
+        id: "ep_dead",
+        invite_id: null,
+        slug: "dead",
+        hostname: "dead.example",
+        account_id: "act_3",
+        status: "revoked",
+        revoke_reason: "admin",
+        revoked_at: "2026-09-01T00:00:00.000Z",
+        cf_tunnel_id: "t-dead",
+      }),
+    );
+
+    expect(await db.finishFailedRevoke({ id: "ep_live", cfTunnelId: "t-live", at })).toBe(false);
+    expect((await db.getEndpointById("ep_live"))?.status).toBe("active");
+    expect(await db.finishFailedRevoke({ id: "ep_dead", cfTunnelId: "t-dead", at })).toBe(false);
+    expect((await db.getEndpointById("ep_dead"))?.revoke_reason).toBe("admin");
+    expect(await db.finishFailedRevoke({ id: "ep_fail", cfTunnelId: "t-other", at })).toBe(false);
+    expect((await db.getEndpointById("ep_fail"))?.status).toBe("revoke_failed");
+    expect(await db.finishFailedRevoke({ id: "ep_fail", cfTunnelId: "t-old", at })).toBe(true);
+    expect(await db.getEndpointById("ep_fail")).toMatchObject({
+      status: "revoked",
+      revoked_at: at,
+      revoke_reason: "refunded",
+      cf_tunnel_id: "t-old",
+    });
+    expect(await db.finishFailedRevoke({ id: "ep_fail", cfTunnelId: "t-old", at })).toBe(false);
   });
 
   it("insertAudit roundtrips via listAudits", async () => {
@@ -204,8 +527,8 @@ describe("memory ConnectDb", () => {
 
   it("mutations on nonexistent ids are silent no-ops (D1 UPDATE parity contract)", async () => {
     const db = createMemoryConnectDb();
-    await expect(db.markEndpointRevoked("nope", "2026-07-24T04:00:00.000Z")).resolves.toBeUndefined();
-    await expect(db.markEndpointRevokeFailed("nope")).resolves.toBeUndefined();
+    await expect(db.markEndpointRevoked("nope", "2026-07-24T04:00:00.000Z", "expired")).resolves.toBeUndefined();
+    await expect(db.markEndpointRevokeFailed("nope", "expired")).resolves.toBeUndefined();
     await expect(db.updateInviteStatus("nope", { status: "revoked" })).resolves.toBeUndefined();
     expect(await db.listEndpoints()).toHaveLength(0);
     expect(await db.listInvites()).toHaveLength(0);
@@ -275,6 +598,308 @@ function createSpyD1(respond: { first?: unknown; all?: unknown[] } = {}): {
   };
   return { d1, calls };
 }
+
+function createSqliteConnectDb(): { sqlite: Database.Database; db: ConnectDb } {
+  const sqlite = new Database(":memory:");
+  const schema = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+  sqlite.exec(schema);
+  type SyncPrepared = D1PreparedStatement & { runSync(): { meta: { changes: number } } };
+  const d1: D1Database = {
+    prepare(query: string): D1PreparedStatement {
+      const stmt = sqlite.prepare(query);
+      let values: unknown[] = [];
+      const api: SyncPrepared = {
+        bind(...next: unknown[]) {
+          values = next;
+          return api;
+        },
+        async first<T>() {
+          return (stmt.get(...values) as T | undefined) ?? null;
+        },
+        async all<T>() {
+          return { results: stmt.all(...values) as T[] };
+        },
+        async run() {
+          const result = stmt.run(...values);
+          return { meta: { changes: result.changes } };
+        },
+        runSync() {
+          const result = stmt.run(...values);
+          return { meta: { changes: result.changes } };
+        },
+      };
+      return api;
+    },
+    async batch(statements) {
+      const run = sqlite.transaction(() =>
+        statements.map((statement) => (statement as SyncPrepared).runSync()),
+      );
+      return run();
+    },
+  };
+  return { sqlite, db: createD1ConnectDb(d1) };
+}
+
+async function exerciseInstanceLinkDb(db: ConnectDb): Promise<void> {
+  const row = makeInstanceLinkRequest();
+  await db.insertInstanceLinkRequest(row);
+  expect(await db.getInstanceLinkRequestById(row.id)).toEqual(row);
+  expect(await db.getInstanceLinkRequestByPollSecretSha(row.poll_secret_sha256)).toEqual(row);
+  expect(await db.getInstanceLinkRequestById("missing")).toBeNull();
+  expect(await db.getInstanceLinkRequestByPollSecretSha("missing")).toBeNull();
+
+  expect(await db.approveInstanceLinkRequest(row.id, "act_1", "2026-10-03T00:10:00.000Z")).toBe(true);
+  expect(await db.approveInstanceLinkRequest(row.id, "act_1", "2026-10-03T00:11:00.000Z")).toBe(false);
+  expect(await db.getInstanceLinkRequestById(row.id)).toMatchObject({
+    status: "approved",
+    account_id: "act_1",
+    approved_at: "2026-10-03T00:10:00.000Z",
+  });
+
+  const expired = makeInstanceLinkRequest({ id: "ilr_expired", poll_secret_sha256: "poll-sha-expired" });
+  await db.insertInstanceLinkRequest(expired);
+  expect(await db.approveInstanceLinkRequest(expired.id, "act_1", "2026-10-03T00:30:00.001Z")).toBe(false);
+  expect(await db.touchInstanceLinkPoll(expired.id, "2026-10-03T00:20:00.000Z")).toBe(true);
+  expect(await db.touchInstanceLinkPoll(expired.id, "2026-10-03T00:20:00.001Z")).toBe(false);
+  expect(await db.getInstanceLinkRequestById(expired.id)).toMatchObject({
+    last_polled_at: "2026-10-03T00:20:00.000Z",
+  });
+
+  await db.insertInstanceCredential(makeInstanceCredential());
+  await db.insertInstanceCredential(
+    makeInstanceCredential({
+      id: "icr_keep",
+      credential_sha256: "credential-sha-keep",
+      account_id: "act_1",
+      link_request_id: "ilr_keep",
+    }),
+  );
+  await db.insertInstanceCredential(
+    makeInstanceCredential({
+      id: "icr_other-account",
+      credential_sha256: "credential-sha-other-account",
+      account_id: "act_2",
+      link_request_id: "ilr_other-account",
+    }),
+  );
+  expect(await db.getActiveInstanceCredentialBySha("credential-sha-1")).toMatchObject({ id: "icr_1" });
+  expect(await db.getActiveInstanceCredentialBySha("credential-sha-keep")).toMatchObject({ id: "icr_keep" });
+  expect(await db.getActiveInstanceCredentialBySha("credential-sha-other-account")).toMatchObject({
+    id: "icr_other-account",
+  });
+  await db.touchInstanceCredential("icr_keep", "2026-10-03T00:15:00.000Z");
+  expect(await db.getActiveInstanceCredentialBySha("credential-sha-keep")).toMatchObject({
+    last_used_at: "2026-10-03T00:15:00.000Z",
+  });
+  await db.revokeInstanceCredential("icr_keep", "2026-10-03T00:16:00.000Z");
+  expect(await db.getActiveInstanceCredentialBySha("credential-sha-keep")).toBeNull();
+}
+
+describe("instance link DB methods", () => {
+  async function exerciseOneCredentialPerRequest(db: ConnectDb): Promise<void> {
+    await db.insertInstanceCredential(makeInstanceCredential({ id: "icr_first", credential_sha256: "sha-first", link_request_id: "ilr_shared" }));
+    await expect(
+      db.insertInstanceCredential(makeInstanceCredential({ id: "icr_second", credential_sha256: "sha-second", link_request_id: "ilr_shared" })),
+    ).rejects.toThrow(/UNIQUE/i);
+  }
+
+  it("allows one credential per link request in memory, like D1", async () => {
+    await exerciseOneCredentialPerRequest(createMemoryConnectDb());
+  });
+
+  it("allows one credential per link request in D1", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseOneCredentialPerRequest(db);
+  });
+
+  async function exerciseInstanceLinkRetention(db: ConnectDb): Promise<void> {
+    await db.insertInstanceLinkRequest(makeInstanceLinkRequest({
+      id: "ilr_old_1", poll_secret_sha256: "poll-old-1", expires_at: "2026-10-01T00:00:00.000Z",
+    }));
+    await db.insertInstanceLinkRequest(makeInstanceLinkRequest({
+      id: "ilr_old_2", poll_secret_sha256: "poll-old-2", expires_at: "2026-10-02T00:00:00.000Z", status: "approved",
+    }));
+    await db.insertInstanceLinkRequest(makeInstanceLinkRequest({
+      id: "ilr_recent", poll_secret_sha256: "poll-recent", expires_at: "2026-10-04T00:00:00.000Z", status: "delivered",
+    }));
+    expect(await db.deleteInstanceLinkRequestsExpiredBefore("2026-10-03T00:00:00.000Z", 1)).toBe(1);
+    expect(await db.getInstanceLinkRequestById("ilr_old_1")).toBeNull();
+    expect(await db.getInstanceLinkRequestById("ilr_old_2")).not.toBeNull();
+    expect(await db.getInstanceLinkRequestById("ilr_recent")).not.toBeNull();
+    expect(await db.deleteInstanceLinkRequestsExpiredBefore("2026-10-03T00:00:00.000Z", 100)).toBe(1);
+    expect(await db.getInstanceLinkRequestById("ilr_old_2")).toBeNull();
+  }
+
+  it("retains only recent instance-link requests in memory", async () => {
+    await exerciseInstanceLinkRetention(createMemoryConnectDb());
+  });
+
+  it("retains only recent instance-link requests in D1", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseInstanceLinkRetention(db);
+  });
+
+  type DeliveryDb = ConnectDb & {
+    deliverInstanceCredential(input: {
+      requestId: string;
+      credential: InstanceCredentialRow;
+      nowIso: string;
+    }): Promise<boolean>;
+  };
+
+  async function exerciseAtomicDelivery(db: DeliveryDb): Promise<void> {
+    const request = makeInstanceLinkRequest({ id: "ilr_delivery", poll_secret_sha256: "poll-sha-delivery" });
+    await db.insertInstanceLinkRequest(request);
+    expect(await db.approveInstanceLinkRequest(request.id, "act_1", "2026-10-03T00:01:00.000Z")).toBe(true);
+    const credential = makeInstanceCredential({
+      id: "icr_delivery",
+      link_request_id: request.id,
+      credential_sha256: "credential-sha-delivery",
+      created_at: "2026-10-03T00:02:00.000Z",
+    });
+    expect(await db.deliverInstanceCredential({
+      requestId: request.id,
+      credential,
+      nowIso: "2026-10-03T00:02:00.000Z",
+    })).toBe(true);
+    expect(await db.deliverInstanceCredential({
+      requestId: request.id,
+      credential: { ...credential, id: "icr_delivery_retry", credential_sha256: "credential-sha-retry" },
+      nowIso: "2026-10-03T00:03:00.000Z",
+    })).toBe(false);
+    expect(await db.getInstanceLinkRequestById(request.id)).toMatchObject({ status: "delivered" });
+    expect(await db.getActiveInstanceCredentialBySha(credential.credential_sha256)).toMatchObject({ id: credential.id });
+  }
+
+  async function exerciseSameInstantRedelivery(db: DeliveryDb): Promise<void> {
+    // Two polls of one request that read the same clock: the loser inserts nothing and must not
+    // revoke the credential the winner already handed out.
+    const request = makeInstanceLinkRequest({ id: "ilr_same_ms", poll_secret_sha256: "poll-sha-same-ms" });
+    await db.insertInstanceLinkRequest(request);
+    await db.approveInstanceLinkRequest(request.id, "act_1", "2026-10-03T00:01:00.000Z");
+    const at = "2026-10-03T00:02:00.000Z";
+    const credential = makeInstanceCredential({
+      id: "icr_winner",
+      link_request_id: request.id,
+      credential_sha256: "credential-sha-winner",
+      created_at: at,
+    });
+    expect(await db.deliverInstanceCredential({ requestId: request.id, credential, nowIso: at })).toBe(true);
+    expect(await db.deliverInstanceCredential({
+      requestId: request.id,
+      credential: { ...credential, id: "icr_loser", credential_sha256: "credential-sha-loser" },
+      nowIso: at,
+    })).toBe(false);
+    expect(await db.getActiveInstanceCredentialBySha("credential-sha-winner")).toMatchObject({ id: "icr_winner" });
+  }
+
+  it("keeps the delivered credential when the same request is delivered again in the same instant, in memory", async () => {
+    await exerciseSameInstantRedelivery(createMemoryConnectDb() as DeliveryDb);
+  });
+
+  it("keeps the delivered credential when the same request is delivered again in the same instant, in D1", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseSameInstantRedelivery(db as DeliveryDb);
+  });
+
+  it("delivers an instance credential atomically in memory", async () => {
+    await exerciseAtomicDelivery(createMemoryConnectDb() as DeliveryDb);
+  });
+
+  it("delivers an instance credential atomically in D1", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseAtomicDelivery(db as DeliveryDb);
+  });
+
+  async function exerciseDeliveryRollback(db: DeliveryDb): Promise<void> {
+    const request = makeInstanceLinkRequest({ id: "ilr_rollback", poll_secret_sha256: "poll-sha-rollback" });
+    await db.insertInstanceLinkRequest(request);
+    await db.approveInstanceLinkRequest(request.id, "act_1", "2026-10-03T00:01:00.000Z");
+    await db.insertInstanceCredential(makeInstanceCredential({
+      id: "icr_collision",
+      credential_sha256: "credential-sha-existing",
+      link_request_id: "ilr_other",
+    }));
+    await expect(db.deliverInstanceCredential({
+      requestId: request.id,
+      credential: makeInstanceCredential({
+        id: "icr_collision",
+        credential_sha256: "credential-sha-new",
+        link_request_id: request.id,
+      }),
+      nowIso: "2026-10-03T00:02:00.000Z",
+    })).rejects.toThrow(/UNIQUE/i);
+    expect(await db.getInstanceLinkRequestById(request.id)).toMatchObject({ status: "approved" });
+    expect(await db.getActiveInstanceCredentialBySha("credential-sha-new")).toBeNull();
+  }
+
+  it("rolls back a failed delivery in memory", async () => {
+    await exerciseDeliveryRollback(createMemoryConnectDb() as DeliveryDb);
+  });
+
+  it("rolls back a failed delivery in D1", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseDeliveryRollback(db as DeliveryDb);
+  });
+
+  async function exerciseCredentialRotationOrdering(db: DeliveryDb, newerFirst: boolean): Promise<void> {
+    const requestA = makeInstanceLinkRequest({ id: "ilr_a", poll_secret_sha256: "poll-sha-a" });
+    const requestB = makeInstanceLinkRequest({ id: "ilr_b", poll_secret_sha256: "poll-sha-b" });
+    await db.insertInstanceLinkRequest(requestA);
+    await db.insertInstanceLinkRequest(requestB);
+    await db.approveInstanceLinkRequest(requestA.id, "act_1", "2026-10-03T00:00:00.000Z");
+    await db.approveInstanceLinkRequest(requestB.id, "act_1", "2026-10-03T00:00:00.000Z");
+    const deliver = async (request: InstanceLinkRequestRow, id: string, createdAt: string) =>
+      db.deliverInstanceCredential({
+        requestId: request.id,
+        credential: makeInstanceCredential({
+          id,
+          link_request_id: request.id,
+          credential_sha256: `credential-sha-${id}`,
+          created_at: createdAt,
+        }),
+        nowIso: createdAt,
+      });
+    // A slower poll can commit after a faster one even though its clock read is earlier. Whatever
+    // the order, a delivery that reports success must hand out a credential that is still active,
+    // and the account keeps exactly one: the one delivered last.
+    const [first, last] = newerFirst
+      ? [{ request: requestB, id: "icr_b", at: "2026-10-03T00:02:00.000Z" }, { request: requestA, id: "icr_a", at: "2026-10-03T00:01:00.000Z" }]
+      : [{ request: requestA, id: "icr_a", at: "2026-10-03T00:01:00.000Z" }, { request: requestB, id: "icr_b", at: "2026-10-03T00:02:00.000Z" }];
+    expect(await deliver(first.request, first.id, first.at)).toBe(true);
+    expect(await db.getActiveInstanceCredentialBySha(`credential-sha-${first.id}`)).toMatchObject({ id: first.id });
+    expect(await deliver(last.request, last.id, last.at)).toBe(true);
+    expect(await db.getActiveInstanceCredentialBySha(`credential-sha-${last.id}`)).toMatchObject({ id: last.id });
+    expect(await db.getActiveInstanceCredentialBySha(`credential-sha-${first.id}`)).toBeNull();
+  }
+
+  it("memory implementation preserves request and credential CAS semantics", async () => {
+    await exerciseInstanceLinkDb(createMemoryConnectDb());
+  });
+
+  it("D1 implementation preserves request and credential CAS semantics", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseInstanceLinkDb(db);
+  });
+
+  it("keeps only the credential delivered last for older-then-newer memory delivery", async () => {
+    await exerciseCredentialRotationOrdering(createMemoryConnectDb() as DeliveryDb, false);
+  });
+
+  it("keeps only the credential delivered last for newer-then-older memory delivery", async () => {
+    await exerciseCredentialRotationOrdering(createMemoryConnectDb() as DeliveryDb, true);
+  });
+
+  it("keeps only the credential delivered last for older-then-newer D1 delivery", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseCredentialRotationOrdering(db as DeliveryDb, false);
+  });
+
+  it("keeps only the credential delivered last for newer-then-older D1 delivery", async () => {
+    const { db } = createSqliteConnectDb();
+    await exerciseCredentialRotationOrdering(db as DeliveryDb, true);
+  });
+});
 
 describe("D1 ConnectDb SQL", () => {
   it("updateInviteStatus full patch keeps placeholder↔bind alignment", async () => {
@@ -815,12 +1440,80 @@ function entitlement(overrides: Partial<EntitlementRow> = {}): EntitlementRow {
 }
 
 describe("payment-order and provider-neutral entitlement persistence", () => {
+  it("stores Waffo session/order ids and scans reconciliation candidates", async () => {
+    const db = createMemoryConnectDb();
+    const row = paymentOrder({
+      id: "ord_waffo",
+      checkout_token_sha256: "sha_waffo",
+      provider: "waffo",
+      out_trade_no: "MC-WAFFO",
+      waffo_session_id: "cs_waffo",
+      waffo_order_id: "ORD_WAFFO",
+      created_at: "2026-10-01T00:00:00.000Z",
+    });
+    await db.insertPaymentOrder(row);
+    await db.insertPaymentOrder(
+      paymentOrder({
+        id: "ord_waffo_fulfilled",
+        checkout_token_sha256: "sha_waffo_fulfilled",
+        provider: "waffo",
+        out_trade_no: "MC-WAFFO-FULFILLED",
+        status: "fulfilled",
+        created_at: "2026-10-01T00:00:01.000Z",
+      }),
+    );
+
+    expect(await db.getPaymentOrderById(row.id)).toEqual(row);
+    expect(await db.listPaymentOrdersForReconciliation("waffo", {
+      unpaidSinceIso: "2026-09-30T00:00:00.000Z",
+      settledSinceIso: "2026-09-30T00:00:00.000Z",
+      limit: 10,
+    })).toEqual([
+      expect.objectContaining({ id: "ord_waffo_fulfilled", status: "fulfilled" }),
+      row,
+    ]);
+  });
+
+  it("reconciliation scan uses status windows, NULL-first query order, and a limit", async () => {
+    const db = createMemoryConnectDb();
+    const base = paymentOrder({ provider: "waffo", status: "created" });
+    await db.insertPaymentOrder({ ...base, id: "ord_null_old", checkout_token_sha256: "sha_null_old", out_trade_no: "MC_NULL_OLD", created_at: "2026-10-01T00:00:00.000Z", last_queried_at: null });
+    await db.insertPaymentOrder({ ...base, id: "ord_null_new", checkout_token_sha256: "sha_null_new", out_trade_no: "MC_NULL_NEW", created_at: "2026-10-02T00:00:00.000Z", last_queried_at: null });
+    await db.insertPaymentOrder({ ...base, id: "ord_queried", checkout_token_sha256: "sha_queried", out_trade_no: "MC_QUERIED", created_at: "2026-10-02T00:00:01.000Z", last_queried_at: "2026-09-30T00:00:00.000Z" });
+    await db.insertPaymentOrder({ ...base, id: "ord_paid_old", checkout_token_sha256: "sha_paid_old", out_trade_no: "MC_PAID_OLD", status: "paid", created_at: "2026-09-20T00:00:00.000Z" });
+    await db.insertPaymentOrder({ ...base, id: "ord_closed", checkout_token_sha256: "sha_closed", out_trade_no: "MC_CLOSED", status: "closed" });
+    await db.insertPaymentOrder({ ...base, id: "ord_refunded", checkout_token_sha256: "sha_refunded", out_trade_no: "MC_REFUNDED", status: "refunded" });
+    expect((await db.listPaymentOrdersForReconciliation("waffo", {
+      unpaidSinceIso: "2026-09-25T00:00:00.000Z",
+      settledSinceIso: "2026-09-15T00:00:00.000Z",
+      limit: 2,
+    })).map((row) => row.id)).toEqual(["ord_null_new", "ord_null_old"]);
+    const allCandidates = await db.listPaymentOrdersForReconciliation("waffo", {
+      unpaidSinceIso: "2026-09-25T00:00:00.000Z",
+      settledSinceIso: "2026-09-15T00:00:00.000Z",
+      limit: 10,
+    });
+    expect(allCandidates.map((row) => row.id)).toContain("ord_paid_old");
+    expect(allCandidates.map((row) => row.id)).not.toEqual(expect.arrayContaining(["ord_closed", "ord_refunded"]));
+  });
+
+  it("counts only this account's orders inside the checkout window", async () => {
+    const db = createMemoryConnectDb();
+    const base = paymentOrder({ provider: "waffo", account_id: "act_limit", created_at: "2026-10-02T09:00:00.000Z" });
+    await db.insertPaymentOrder(base);
+    await db.insertPaymentOrder({ ...base, id: "ord_limit_boundary", checkout_token_sha256: "sha_limit_boundary", out_trade_no: "MC_LIMIT_BOUNDARY", created_at: "2026-10-01T10:00:00.000Z" });
+    await db.insertPaymentOrder({ ...base, id: "ord_limit_old", checkout_token_sha256: "sha_limit_old", out_trade_no: "MC_LIMIT_OLD", created_at: "2026-10-01T09:59:59.999Z" });
+    await db.insertPaymentOrder({ ...base, id: "ord_other_account", checkout_token_sha256: "sha_other_account", out_trade_no: "MC_OTHER_ACCOUNT", account_id: "act_other" });
+    const candidate = { ...base, id: "ord_limit_candidate", checkout_token_sha256: "sha_limit_candidate", out_trade_no: "MC_LIMIT_CANDIDATE" };
+    expect(await db.insertPaymentOrderWithinDailyLimit(candidate, { sinceIso: "2026-10-01T10:00:00.000Z", limit: 2 })).toBe(false);
+    expect(await db.getPaymentOrderById(candidate.id)).toBeNull();
+  });
+
   it("round-trips and updates an Alipay order by every server-owned key", async () => {
     const db = createMemoryConnectDb();
     const row = paymentOrder();
     expect(await db.insertPaymentOrder(row)).toEqual(row);
     expect(await db.getPaymentOrderById(row.id)).toEqual(row);
-    expect(await db.getPaymentOrderByCheckoutHash(row.checkout_token_sha256)).toEqual(row);
     expect(await db.getPaymentOrderByOutTradeNo(row.out_trade_no)).toEqual(row);
 
     await db.updatePaymentOrder(row.id, {

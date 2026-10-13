@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FREE_LLM_PRESET, isFreeLlmPreset, llmConfigError } from "@media-track/workflow";
 import {
   acquireLlmPreflightError,
+  resolveAgentModelConfig,
   customDirNamesFromEnv,
   isCookieSecure,
   getLlmConfig,
@@ -21,6 +23,7 @@ import {
   resolveIsDesktop,
   getTmdbAccesses,
   LLM_BASE_URL_SETTING_KEY,
+  LLM_API_KEY_SETTING_KEY,
   LLM_MODEL_ID_SETTING_KEY,
   PROWLARR_API_KEY_SETTING_KEY,
   PROWLARR_BASE_URL_SETTING_KEY,
@@ -86,25 +89,189 @@ describe("getLlmConfig", () => {
   });
 });
 
-describe("acquireLlmPreflightError (点击获取时的 LLM 预检)", () => {
+describe("resolveAgentModelConfig（DB → env → 出厂免费预设）", () => {
+  const cast = (m: Record<string, string>) => m as unknown as NodeJS.ProcessEnv;
+
+  it("DB 有值 → DB 值生效（env 不参与），source db", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({
+        [LLM_BASE_URL_SETTING_KEY]: "https://db.example/v1",
+        [LLM_MODEL_ID_SETTING_KEY]: "db-model",
+        [LLM_API_KEY_SETTING_KEY]: "sk-db",
+      }),
+      cast({ AGENT_MODEL_BASE_URL: "https://env.example/v1", AGENT_MODEL_ID: "env-model" }),
+    );
+    expect(cfg).toEqual({
+      apiKey: "sk-db",
+      baseURL: "https://db.example/v1",
+      modelId: "db-model",
+      source: "db",
+    });
+  });
+
+  it("DB 空、env 有值（含 legacy XIAOMI_MIMO_*）→ env 值生效，source env", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({}),
+      cast({ AGENT_MODEL_BASE_URL: "https://env.example/v1", XIAOMI_MIMO_MODEL_ID: "legacy-model" }),
+    );
+    expect(cfg).toEqual({ baseURL: "https://env.example/v1", modelId: "legacy-model", source: "env" });
+  });
+
+  it("DB 只补了一项（如只有 key）、其余靠 env → source db（DB 层参与了就算 db）", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({ [LLM_API_KEY_SETTING_KEY]: "sk-db" }),
+      cast({ AGENT_MODEL_BASE_URL: "https://env.example/v1", AGENT_MODEL_ID: "env-model" }),
+    );
+    expect(cfg).toEqual({
+      apiKey: "sk-db",
+      baseURL: "https://env.example/v1",
+      modelId: "env-model",
+      source: "db",
+    });
+  });
+
+  it("DB 空 + env 空 → 回落出厂免费预设（keyless），source free-preset", async () => {
+    const cfg = await resolveAgentModelConfig(repoMap({}), cast({}));
+    expect(cfg).toEqual({
+      baseURL: FREE_LLM_PRESET.baseURL,
+      modelId: FREE_LLM_PRESET.modelId,
+      source: "free-preset",
+    });
+    // 回落结果必须能被 isFreeLlmPreset 判成免费档 —— 设置页胶囊/失败文案（Task 4）靠它。
+    expect(isFreeLlmPreset(cfg)).toBe(true);
+  });
+
+  it("env 三键是空串/空白（.env.example 照抄形态）→ 也照样回落免费预设", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({}),
+      cast({ AGENT_MODEL_API_KEY: "", AGENT_MODEL_BASE_URL: "   " }),
+    );
+    expect(cfg.source).toBe("free-preset");
+    expect(cfg.modelId).toBe(FREE_LLM_PRESET.modelId);
+  });
+
+  it("DB 只剩残留 apiKey（url/model 空，「清空地址保存」后 key blank-keep 的形态）→ 照样回落免费预设，且返回对象不含 apiKey 键", async () => {
+    const cfg = await resolveAgentModelConfig(repoMap({ [LLM_API_KEY_SETTING_KEY]: "sk-residual" }), cast({}));
+    // toEqual 严格断言：多出的 apiKey 键（值非 undefined）会让它失败。
+    expect(cfg).toEqual({
+      baseURL: FREE_LLM_PRESET.baseURL,
+      modelId: FREE_LLM_PRESET.modelId,
+      source: "free-preset",
+    });
+    // 残留 key 属于用户自配服务（如 DeepSeek），绝不能作为 Authorization 头发给
+    // Kilo 免费池第三方 —— 回落分支必须丢弃它。
+    expect("apiKey" in cfg).toBe(false);
+    expect(isFreeLlmPreset(cfg)).toBe(true);
+  });
+
+  it("DB 存预设地址+模型名、apiKey 是残留（「换回免费模型」按钮写库后的形态）→ 返回预设值且不带 apiKey 键", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({
+        [LLM_BASE_URL_SETTING_KEY]: FREE_LLM_PRESET.baseURL,
+        [LLM_MODEL_ID_SETTING_KEY]: FREE_LLM_PRESET.modelId,
+        [LLM_API_KEY_SETTING_KEY]: "sk-x",
+      }),
+      cast({}),
+    );
+    // toEqual 严格断言：多出的 apiKey 键（值非 undefined）会让它失败。生效值
+    // 等于免费池预设时，blank-keep 的残留 key 不得作为 Authorization 头发给
+    // Kilo 第三方免费池 —— 非回落分支必须同样丢弃它（回落分支已在上一用例覆盖）。
+    expect(cfg).toEqual({
+      baseURL: FREE_LLM_PRESET.baseURL,
+      modelId: FREE_LLM_PRESET.modelId,
+      source: "db",
+    });
+    expect("apiKey" in cfg).toBe(false);
+    expect(isFreeLlmPreset(cfg)).toBe(true);
+  });
+
+  // Copilot r2 B：与 agent-model.ts 的 createAgentModelFromEnv 同一条规则 —— env
+  // 内部 modern→legacy 兜底必须 blank-aware：.env.example 的空串 AGENT_MODEL_*
+  // 不能遮蔽有值的 XIAOMI_MIMO_*（否则免费预设回落把 legacy 配置静默换 Kilo）。
+  // DB→env 的 ?? 语义不动（DB 值 undefined 才看 env）。
+  it("env 层空串 AGENT_MODEL_* 不遮蔽 legacy XIAOMI_MIMO_*（每对取第一个非空白值）", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({}),
+      cast({
+        AGENT_MODEL_BASE_URL: "",
+        AGENT_MODEL_ID: "",
+        XIAOMI_MIMO_BASE_URL: "https://x/v1",
+        XIAOMI_MIMO_MODEL_ID: "m",
+      }),
+    );
+    expect(cfg).toEqual({ baseURL: "https://x/v1", modelId: "m", source: "env" });
+  });
+
+  it("半截配置（只有 baseURL）不回落 —— 原样返回，交给下游 llmConfigError fail-fast（用户错误不静默变免费池）", async () => {
+    const cfg = await resolveAgentModelConfig(repoMap({}), cast({ AGENT_MODEL_BASE_URL: "https://half.example/v1" }));
+    expect(cfg).toEqual({ baseURL: "https://half.example/v1", source: "env" });
+  });
+
+  it("DB 半截（baseURL 有、modelId 空）同样不回落 —— 原样返回（半截用户错误仍 fail-fast，回归保护）", async () => {
+    const cfg = await resolveAgentModelConfig(
+      repoMap({ [LLM_BASE_URL_SETTING_KEY]: "https://half.example/v1" }),
+      cast({}),
+    );
+    expect(cfg).toEqual({ baseURL: "https://half.example/v1", source: "db" });
+  });
+});
+
+describe("acquireLlmPreflightError（收窄：免费预设兜底后只拦半截配置，零配置不拦）", () => {
   const configured = repoMap({
     [LLM_BASE_URL_SETTING_KEY]: "https://api.example.com/v1",
     [LLM_MODEL_ID_SETTING_KEY]: "gpt-4o-mini",
   });
   const unconfigured = repoMap({});
+  const liveEnv = { MEDIA_TRACK_AGENT_ADAPTER: "vercel-ai" } as unknown as NodeJS.ProcessEnv;
 
-  it("live (vercel-ai) + unconfigured → the friendly 未配置 message (blocks enqueue)", async () => {
+  it("live (vercel-ai) + unconfigured → null（出厂免费预设兜底，开箱即用不拦）", async () => {
     const message = await acquireLlmPreflightError({
       settings: unconfigured,
-      env: { MEDIA_TRACK_AGENT_ADAPTER: "vercel-ai" } as unknown as NodeJS.ProcessEnv,
+      env: liveEnv,
     });
+    expect(message).toBeNull();
+  });
+
+  it("live (vercel-ai) + fully configured → null", async () => {
+    const message = await acquireLlmPreflightError({
+      settings: configured,
+      env: liveEnv,
+    });
+    expect(message).toBeNull();
+  });
+
+  it("live (vercel-ai) + DB 半截（baseURL 有、modelId 空）→ 返回 llmConfigError 文案（点击时友好拦截，杜绝 ghost run）", async () => {
+    const message = await acquireLlmPreflightError({
+      settings: repoMap({ [LLM_BASE_URL_SETTING_KEY]: "https://half.example/v1" }),
+      env: liveEnv,
+    });
+    expect(message).toBe(llmConfigError({ baseURL: "https://half.example/v1" }));
     expect(message).toContain("未配置 AI 模型");
   });
 
-  it("live (vercel-ai) + fully configured → null (common case, unchanged behavior)", async () => {
+  it("live (vercel-ai) + DB 半截镜像（modelId 有、baseURL 空）→ 同样拦截", async () => {
     const message = await acquireLlmPreflightError({
-      settings: configured,
-      env: { MEDIA_TRACK_AGENT_ADAPTER: "vercel-ai" } as unknown as NodeJS.ProcessEnv,
+      settings: repoMap({ [LLM_MODEL_ID_SETTING_KEY]: "orphan-model" }),
+      env: liveEnv,
+    });
+    expect(message).toBe(llmConfigError({ modelId: "orphan-model" }));
+  });
+
+  it("live (vercel-ai) + env 半截（baseURL 有、modelId 空）→ 同样拦截（半截可能来自任一层）", async () => {
+    const message = await acquireLlmPreflightError({
+      settings: unconfigured,
+      env: {
+        MEDIA_TRACK_AGENT_ADAPTER: "vercel-ai",
+        AGENT_MODEL_BASE_URL: "https://half-env.example/v1",
+      } as unknown as NodeJS.ProcessEnv,
+    });
+    expect(message).toBe(llmConfigError({ baseURL: "https://half-env.example/v1" }));
+  });
+
+  it("fake/demo adapter + 半截配置 → null (no LLM needed, never blocks)", async () => {
+    const message = await acquireLlmPreflightError({
+      settings: repoMap({ [LLM_BASE_URL_SETTING_KEY]: "https://half.example/v1" }),
+      env: { MEDIA_TRACK_AGENT_ADAPTER: "fake" } as unknown as NodeJS.ProcessEnv,
     });
     expect(message).toBeNull();
   });
@@ -1281,5 +1448,131 @@ describe("queueing on a drive whose login died names that drive's brand", () => 
     const refusal = { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个123网盘后再获取。" };
     expect(await rt.queueCandidateSeries("tmdb_tv_1_s1", "cs_pan123_1")).toEqual(refusal);
     expect(await rt.queueCandidateTracking("tmdb_tv_1_s1", "cs_pan123_1")).toEqual(refusal);
+  });
+});
+
+describe("runNextQueuedWorkflow — queued runs going side by side", () => {
+  // The worker's drain calls this once per claim, with its drive filter; several runs
+  // can be going at once. Harness as for runScheduledType3: in-memory SQLite, the
+  // queued runners and the push stubbed (no drive, no model, no network).
+  const idle = async () => ({ status: "idle" as const });
+  const stubs = {
+    runQueuedType2Workflow: vi.fn(idle),
+    runQueuedSeriesInitialization: vi.fn(idle),
+    runQueuedMovieAcquisition: vi.fn(idle),
+    runQueuedReplaceRequest: vi.fn(idle),
+    runQueuedStagingRecovery: vi.fn(idle),
+    enqueueUrgentReplaceRequests: vi.fn(async () => undefined),
+    sendPushNotifications: vi.fn(async () => undefined),
+  };
+  const prevPg = process.env.MEDIA_TRACK_POSTGRES_URL;
+  let rt: typeof import("./workflow-runtime");
+
+  const boot = async () => {
+    for (const stub of Object.values(stubs)) stub.mockReset();
+    for (const runner of [
+      stubs.runQueuedType2Workflow,
+      stubs.runQueuedSeriesInitialization,
+      stubs.runQueuedMovieAcquisition,
+      stubs.runQueuedReplaceRequest,
+      stubs.runQueuedStagingRecovery,
+    ]) {
+      runner.mockImplementation(idle);
+    }
+    process.env.MEDIA_TRACK_SQLITE_PATH = ":memory:";
+    delete process.env.MEDIA_TRACK_POSTGRES_URL;
+    vi.resetModules();
+    vi.doMock("@media-track/workflow", async () => {
+      const actual = await vi.importActual<typeof import("@media-track/workflow")>("@media-track/workflow");
+      return { ...actual, ...stubs };
+    });
+    rt = await import("./workflow-runtime");
+    return rt.getWorkflowRepository();
+  };
+
+  afterEach(() => {
+    vi.doUnmock("@media-track/workflow");
+    delete process.env.MEDIA_TRACK_SQLITE_PATH;
+    if (prevPg !== undefined) process.env.MEDIA_TRACK_POSTGRES_URL = prevPg;
+    vi.resetModules();
+  });
+
+  it("hands the drain's claim options to every queued runner", async () => {
+    await boot();
+    const claim = { excludeConnectedStorageIds: ["cs_115"], excludeUnbound: true, onClaimed: vi.fn() };
+
+    expect(await rt.runNextQueuedWorkflow(claim)).toEqual({ status: "idle" });
+    for (const runner of [
+      stubs.runQueuedType2Workflow,
+      stubs.runQueuedSeriesInitialization,
+      stubs.runQueuedMovieAcquisition,
+      stubs.runQueuedReplaceRequest,
+      stubs.runQueuedStagingRecovery,
+    ]) {
+      expect(runner).toHaveBeenCalledWith(expect.objectContaining({ claim }));
+    }
+  });
+
+  it("pushes only the finished run's notifications, not those of a run going beside it", async () => {
+    const repository = await boot();
+    const event = (id: string, workflowRunId: string) => ({
+      id,
+      workflowRunId,
+      kind: "movie_obtained",
+      title: id,
+      body: id,
+      createdAt: new Date().toISOString(),
+      trigger: "user" as const,
+    });
+    vi.spyOn(repository, "listRecentNotificationsWithAccount").mockResolvedValue([
+      { accountId: "acct_default", connectedStorageId: "cs_115", notification: event("n_115", "run_115") },
+      { accountId: "acct_default", connectedStorageId: "cs_guangya", notification: event("n_guangya", "run_guangya") },
+    ]);
+    stubs.runQueuedMovieAcquisition.mockImplementation(
+      async () => ({ status: "ran", workflowRunId: "run_115", workflowStatus: "succeeded" }) as never,
+    );
+
+    await rt.runNextQueuedWorkflow();
+
+    expect(stubs.sendPushNotifications).toHaveBeenCalledTimes(1);
+    expect(stubs.sendPushNotifications).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: expect.objectContaining({ id: "n_115" }) }),
+    );
+  });
+
+  it("a series run pushes the notifications on its per-season record too", async () => {
+    // Series init saves its notifications on `${runId}_s${n}` (see runner-v2).
+    const repository = await boot();
+    const event = (id: string, workflowRunId: string) => ({
+      id,
+      workflowRunId,
+      kind: "series_initialized",
+      title: id,
+      body: id,
+      createdAt: new Date().toISOString(),
+      trigger: "user" as const,
+    });
+    vi.spyOn(repository, "listRecentNotificationsWithAccount").mockResolvedValue([
+      { accountId: "acct_default", connectedStorageId: "cs_115", notification: event("n_s1", "run_series_s1") },
+      { accountId: "acct_default", connectedStorageId: "cs_115", notification: event("n_lookalike", "run_series_sx") },
+      { accountId: "acct_default", connectedStorageId: "cs_quark", notification: event("n_other", "run_series2") },
+    ]);
+    stubs.runQueuedSeriesInitialization.mockImplementation(
+      async () => ({ status: "ran", workflowRunId: "run_series", workflowStatus: "succeeded" }) as never,
+    );
+
+    await rt.runNextQueuedWorkflow();
+
+    expect(stubs.sendPushNotifications).toHaveBeenCalledTimes(1);
+    expect(stubs.sendPushNotifications).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: expect.objectContaining({ id: "n_s1" }) }),
+    );
+  });
+
+  it("reads the 同时处理 setting for the worker (1 when unset)", async () => {
+    const repository = await boot();
+    expect(await rt.getWorkerConcurrency()).toBe(1);
+    await repository.setSetting(rt.PATROL_CONCURRENCY_SETTING_KEY, "5");
+    expect(await rt.getWorkerConcurrency()).toBe(5);
   });
 });

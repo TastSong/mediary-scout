@@ -1,4 +1,4 @@
-import type { PaymentOrderStatus } from "./alipay-order.js";
+import type { PaymentOrderStatus } from "./payment-order.js";
 
 export interface InviteRow {
   id: string;
@@ -37,7 +37,12 @@ export interface EndpointRow {
   grace_until: string | null;
   suspended_at: string | null;
   purge_after: string | null;
+  /** 0009: why it was taken down. Only 'expired' and 'refunded' may be restored by the owner. */
+  revoke_reason: RevokeReason | null;
 }
+
+/** Why an endpoint was taken down. 'admin' is never self-restorable. */
+export type RevokeReason = "expired" | "refunded" | "admin";
 
 /** P3: 付费账号。邮箱即身份;paddle_customer_id 内测手工开的为 null。 */
 export interface AccountRow {
@@ -53,10 +58,10 @@ export interface EntitlementRow {
   id: string;
   account_id: string;
   expires_at: string;
-  source: "alipay" | "paddle" | "founding" | "manual" | "beta";
+  source: "alipay" | "paddle" | "waffo" | "founding" | "manual" | "beta";
   /** Historical Paddle-only field. New grants write null and use the pair below. */
   paddle_transaction_id: string | null;
-  payment_provider: "alipay" | "paddle" | null;
+  payment_provider: "alipay" | "paddle" | "waffo" | null;
   payment_transaction_id: string | null;
   /** Non-null rows remain auditable but no longer contribute usable time. */
   refunded_at: string | null;
@@ -68,9 +73,13 @@ export interface PaymentOrderRow {
   id: string;
   checkout_token_sha256: string;
   account_id: string;
-  provider: "alipay";
+  /** Current checkout provider; historical rows retain their original provider. */
+  provider: "alipay" | "waffo";
   out_trade_no: string;
   trade_no: string | null;
+  /** Waffo checkout session and provider order ids; null for historical rows. */
+  waffo_session_id?: string | null;
+  waffo_order_id?: string | null;
   months: 3 | 12 | 24;
   total_amount: string;
   status: PaymentOrderStatus;
@@ -89,6 +98,9 @@ export type PaymentOrderPatch = Partial<
   Pick<
     PaymentOrderRow,
     | "trade_no"
+    | "expires_at"
+    | "waffo_session_id"
+    | "waffo_order_id"
     | "status"
     | "paid_at"
     | "fulfilled_at"
@@ -104,6 +116,37 @@ export interface PaymentOrderCondition {
   statuses?: readonly PaymentOrderStatus[];
   /** undefined = do not compare; null = require no refund claim; string = require exact claim. */
   refundRequestNo?: string | null;
+}
+
+export interface InstanceLinkRequestRow {
+  id: string;
+  poll_secret_sha256: string;
+  email: string;
+  verify_code: string;
+  status: "pending" | "approved" | "delivered";
+  account_id: string | null;
+  request_ip: string | null;
+  created_at: string;
+  expires_at: string;
+  approved_at: string | null;
+  delivered_at: string | null;
+  last_polled_at: string | null;
+}
+
+export interface InstanceCredentialRow {
+  id: string;
+  account_id: string;
+  credential_sha256: string;
+  link_request_id: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface PaymentOrderReconciliationOptions {
+  unpaidSinceIso: string;
+  settledSinceIso: string;
+  limit: number;
 }
 
 export interface AuditRow {
@@ -177,8 +220,23 @@ export interface ConnectDb {
    * Returns true when THIS call performed the burn (won the race), false when
    * the token was already shown/burned — callers use this for once-only reveal.
    */
-  markEndpointRevoked(endpointId: string, at: string): Promise<void>;
-  markEndpointRevokeFailed(endpointId: string): Promise<void>;
+  markEndpointRevoked(endpointId: string, at: string, reason: RevokeReason): Promise<void>;
+  markEndpointRevokeFailed(endpointId: string, reason: RevokeReason): Promise<void>;
+  /** The account's newest endpoint when it was taken down for expiry or a refund and the account
+   *  has no live endpoint now; otherwise null. Rows revoked by an admin are never restorable. */
+  getRestorableEndpointByAccountId(accountId: string): Promise<EndpointRow | null>;
+  /** Brings a revoked row back with a new tunnel. True only when THIS call flipped it. */
+  reactivateEndpoint(input: {
+    id: string;
+    accountId: string;
+    cfTunnelId: string;
+    cfDnsRecordId: string;
+    tokenSha256: string;
+  }): Promise<boolean>;
+  /** Finishes a failed revoke whose old Cloudflare resources were just deleted. Matches only the row
+   *  as captured (still revoke_failed with that old tunnel), so it never touches a row another request
+   *  has meanwhile restored. True when THIS call flipped it. */
+  finishFailedRevoke(input: { id: string; cfTunnelId: string; at: string }): Promise<boolean>;
   /** Best-effort row removal for orphan compensation (no-op when absent). */
   deleteEndpoint(endpointId: string): Promise<void>;
   insertAudit(row: AuditRow): Promise<void>;
@@ -220,12 +278,34 @@ export interface ConnectDb {
   getAccountById(id: string): Promise<AccountRow | null>;
   getAccountByEmail(email: string): Promise<AccountRow | null>;
   updateAccountLastLogin(id: string, at: string): Promise<void>;
-  // Durable Alipay checkout/payment state.
+  insertInstanceLinkRequest(row: InstanceLinkRequestRow): Promise<void>;
+  getInstanceLinkRequestById(id: string): Promise<InstanceLinkRequestRow | null>;
+  getInstanceLinkRequestByPollSecretSha(sha: string): Promise<InstanceLinkRequestRow | null>;
+  deleteInstanceLinkRequestsExpiredBefore(cutoffIso: string, limit: number): Promise<number>;
+  approveInstanceLinkRequest(id: string, accountId: string, nowIso: string): Promise<boolean>;
+  touchInstanceLinkPoll(id: string, nowIso: string): Promise<boolean>;
+  insertInstanceCredential(row: InstanceCredentialRow): Promise<void>;
+  deliverInstanceCredential(input: {
+    requestId: string;
+    credential: InstanceCredentialRow;
+    nowIso: string;
+  }): Promise<boolean>;
+  getActiveInstanceCredentialBySha(sha: string): Promise<InstanceCredentialRow | null>;
+  revokeInstanceCredential(id: string, nowIso: string): Promise<void>;
+  touchInstanceCredential(id: string, nowIso: string): Promise<void>;
+  // Durable payment state (historical Alipay rows and current Waffo rows).
   insertPaymentOrder(row: PaymentOrderRow): Promise<PaymentOrderRow>;
   getPaymentOrderById(id: string): Promise<PaymentOrderRow | null>;
-  getPaymentOrderByCheckoutHash(sha256: string): Promise<PaymentOrderRow | null>;
   getPaymentOrderByOutTradeNo(outTradeNo: string): Promise<PaymentOrderRow | null>;
-  getPaymentOrderByRefundRequestNo(requestNo: string): Promise<PaymentOrderRow | null>;
+  insertPaymentOrderWithinDailyLimit(
+    row: PaymentOrderRow,
+    options: { sinceIso: string; limit: number },
+  ): Promise<boolean>;
+  /** Waffo reconciliation scan: recent orders that still need payment/refund compensation. */
+  listPaymentOrdersForReconciliation(
+    provider: PaymentOrderRow["provider"],
+    options: PaymentOrderReconciliationOptions,
+  ): Promise<PaymentOrderRow[]>;
   updatePaymentOrder(id: string, patch: PaymentOrderPatch): Promise<void>;
   /** Atomic conditional update used where fulfillment and refunds can race. */
   compareAndSetPaymentOrder(
@@ -270,7 +350,7 @@ export interface D1Database {
    * 缺失时 hitAndCount 回退成逐条 await(行为一致,只是慢),
    * 而不是强迫每个 fake 都实现一个它用不到的方法。
    */
-  batch?(statements: D1PreparedStatement[]): Promise<Array<{ results?: unknown[] }>>;
+  batch?(statements: D1PreparedStatement[]): Promise<Array<{ results?: unknown[]; meta?: { changes?: number } }>>;
 }
 
 type RawRow = Record<string, unknown>;
@@ -312,6 +392,7 @@ function mapEndpoint(row: RawRow): EndpointRow {
     grace_until: (row.grace_until as string | null | undefined) ?? null,
     suspended_at: (row.suspended_at as string | null | undefined) ?? null,
     purge_after: (row.purge_after as string | null | undefined) ?? null,
+    revoke_reason: (row.revoke_reason as EndpointRow["revoke_reason"] | undefined) ?? null,
   };
 }
 
@@ -365,9 +446,11 @@ function mapPaymentOrder(row: RawRow): PaymentOrderRow {
     id: row.id as string,
     checkout_token_sha256: row.checkout_token_sha256 as string,
     account_id: row.account_id as string,
-    provider: "alipay",
+    provider: row.provider as PaymentOrderRow["provider"],
     out_trade_no: row.out_trade_no as string,
     trade_no: row.trade_no as string | null,
+    waffo_session_id: (row.waffo_session_id as string | null | undefined) ?? null,
+    waffo_order_id: (row.waffo_order_id as string | null | undefined) ?? null,
     months: row.months as PaymentOrderRow["months"],
     total_amount: row.total_amount as string,
     status: row.status as PaymentOrderStatus,
@@ -380,6 +463,35 @@ function mapPaymentOrder(row: RawRow): PaymentOrderRow {
     refund_request_no: row.refund_request_no as string | null,
     last_notify_id: row.last_notify_id as string | null,
     last_queried_at: row.last_queried_at as string | null,
+  };
+}
+
+function mapInstanceLinkRequest(row: RawRow): InstanceLinkRequestRow {
+  return {
+    id: row.id as string,
+    poll_secret_sha256: row.poll_secret_sha256 as string,
+    email: row.email as string,
+    verify_code: row.verify_code as string,
+    status: row.status as InstanceLinkRequestRow["status"],
+    account_id: row.account_id as string | null,
+    request_ip: row.request_ip as string | null,
+    created_at: row.created_at as string,
+    expires_at: row.expires_at as string,
+    approved_at: row.approved_at as string | null,
+    delivered_at: row.delivered_at as string | null,
+    last_polled_at: row.last_polled_at as string | null,
+  };
+}
+
+function mapInstanceCredential(row: RawRow): InstanceCredentialRow {
+  return {
+    id: row.id as string,
+    account_id: row.account_id as string,
+    credential_sha256: row.credential_sha256 as string,
+    link_request_id: row.link_request_id as string,
+    created_at: row.created_at as string,
+    last_used_at: row.last_used_at as string | null,
+    revoked_at: row.revoked_at as string | null,
   };
 }
 
@@ -456,8 +568,8 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
       // 展开,测试绿、生产 account_id 丢失(spec 断点 #2 的「内存绿生产坏」)。
       await d1
         .prepare(
-          `INSERT INTO endpoints (id, invite_id, slug, hostname, cf_tunnel_id, cf_access_app_id, cf_access_policy_id, cf_dns_record_id, status, token_sha256, token_ciphertext, token_shown_at, last_seen_at, created_at, revoked_at, account_id, grace_until, suspended_at, purge_after)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO endpoints (id, invite_id, slug, hostname, cf_tunnel_id, cf_access_app_id, cf_access_policy_id, cf_dns_record_id, status, token_sha256, token_ciphertext, token_shown_at, last_seen_at, created_at, revoked_at, account_id, grace_until, suspended_at, purge_after, revoke_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           row.id,
@@ -479,6 +591,7 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
           row.grace_until,
           row.suspended_at,
           row.purge_after,
+          row.revoke_reason,
         )
         .run();
       return { ...row };
@@ -567,18 +680,67 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
       return row?.cnt ?? 0;
     },
 
-    async markEndpointRevoked(endpointId, at) {
+    async markEndpointRevoked(endpointId, at, reason) {
       await d1
-        .prepare(`UPDATE endpoints SET status = 'revoked', revoked_at = ? WHERE id = ?`)
-        .bind(at, endpointId)
+        .prepare(`UPDATE endpoints SET status = 'revoked', revoked_at = ?, revoke_reason = ? WHERE id = ?`)
+        .bind(at, reason, endpointId)
         .run();
     },
 
-    async markEndpointRevokeFailed(endpointId) {
+    async markEndpointRevokeFailed(endpointId, reason) {
       await d1
-        .prepare(`UPDATE endpoints SET status = 'revoke_failed' WHERE id = ?`)
-        .bind(endpointId)
+        .prepare(`UPDATE endpoints SET status = 'revoke_failed', revoke_reason = ? WHERE id = ?`)
+        .bind(reason, endpointId)
         .run();
+    },
+
+    async getRestorableEndpointByAccountId(accountId) {
+      const live = await d1
+        .prepare(`SELECT 1 AS x FROM endpoints WHERE account_id = ? AND status = 'active' LIMIT 1`)
+        .bind(accountId)
+        .first<RawRow>();
+      if (live !== null) return null;
+      const row = await d1
+        .prepare(`SELECT * FROM endpoints WHERE account_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+        .bind(accountId)
+        .first<RawRow>();
+      if (row === null) return null;
+      const endpoint = mapEndpoint(row);
+      const restorable =
+        (endpoint.status === "revoked" || endpoint.status === "revoke_failed") &&
+        (endpoint.revoke_reason === "expired" || endpoint.revoke_reason === "refunded");
+      return restorable ? endpoint : null;
+    },
+
+    async reactivateEndpoint(input) {
+      try {
+        const result = (await d1
+          .prepare(
+            `UPDATE endpoints
+                SET status = 'active', cf_tunnel_id = ?, cf_dns_record_id = ?, token_sha256 = ?,
+                    cf_access_app_id = NULL, cf_access_policy_id = NULL, token_ciphertext = NULL,
+                    token_shown_at = NULL, last_seen_at = NULL, revoked_at = NULL, revoke_reason = NULL
+              WHERE id = ? AND account_id = ? AND status = 'revoked'`,
+          )
+          .bind(input.cfTunnelId, input.cfDnsRecordId, input.tokenSha256, input.id, input.accountId)
+          .run()) as { meta?: { changes?: number } };
+        return (result.meta?.changes ?? 0) === 1;
+      } catch (e) {
+        // idx_endpoints_account_live: another live row of this account appeared meanwhile.
+        if (e instanceof Error && e.message.includes("UNIQUE constraint failed")) return false;
+        throw e;
+      }
+    },
+
+    async finishFailedRevoke(input) {
+      const result = (await d1
+        .prepare(
+          `UPDATE endpoints SET status = 'revoked', revoked_at = ?
+            WHERE id = ? AND status = 'revoke_failed' AND cf_tunnel_id = ?`,
+        )
+        .bind(input.at, input.id, input.cfTunnelId)
+        .run()) as { meta?: { changes?: number } };
+      return (result.meta?.changes ?? 0) === 1;
     },
 
     async deleteEndpoint(endpointId) {
@@ -779,14 +941,208 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
       await d1.prepare(`UPDATE accounts SET last_login_at = ? WHERE id = ?`).bind(at, id).run();
     },
 
+    async insertInstanceLinkRequest(row) {
+      await d1
+        .prepare(
+          `INSERT INTO instance_link_requests
+             (id, poll_secret_sha256, email, verify_code, status, account_id, request_ip,
+              created_at, expires_at, approved_at, delivered_at, last_polled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          row.id,
+          row.poll_secret_sha256,
+          row.email,
+          row.verify_code,
+          row.status,
+          row.account_id,
+          row.request_ip,
+          row.created_at,
+          row.expires_at,
+          row.approved_at,
+          row.delivered_at,
+          row.last_polled_at,
+        )
+        .run();
+    },
+
+    async getInstanceLinkRequestById(id) {
+      const row = await d1
+        .prepare(`SELECT * FROM instance_link_requests WHERE id = ?`)
+        .bind(id)
+        .first<RawRow>();
+      return row === null ? null : mapInstanceLinkRequest(row);
+    },
+
+    async getInstanceLinkRequestByPollSecretSha(sha) {
+      const row = await d1
+        .prepare(`SELECT * FROM instance_link_requests WHERE poll_secret_sha256 = ?`)
+        .bind(sha)
+        .first<RawRow>();
+      return row === null ? null : mapInstanceLinkRequest(row);
+    },
+
+    async deleteInstanceLinkRequestsExpiredBefore(cutoffIso, limit) {
+      if (limit <= 0) return 0;
+      const result = (await d1
+        .prepare(
+          `DELETE FROM instance_link_requests
+            WHERE id IN (
+              SELECT id FROM instance_link_requests
+               WHERE expires_at < ?
+               ORDER BY expires_at ASC, id ASC
+               LIMIT ?
+            )`,
+        )
+        .bind(cutoffIso, limit)
+        .run()) as { meta?: { changes?: number } };
+      return result.meta?.changes ?? 0;
+    },
+
+    async approveInstanceLinkRequest(id, accountId, nowIso) {
+      const result = (await d1
+        .prepare(
+          `UPDATE instance_link_requests
+              SET status = 'approved', account_id = ?, approved_at = ?
+            WHERE id = ? AND status = 'pending' AND expires_at > ?`,
+        )
+        .bind(accountId, nowIso, id, nowIso)
+        .run()) as { meta?: { changes?: number } };
+      return (result.meta?.changes ?? 0) > 0;
+    },
+
+    async touchInstanceLinkPoll(id, nowIso) {
+      const cutoff = new Date(Date.parse(nowIso) - 2_000).toISOString();
+      const result = (await d1
+        .prepare(
+          `UPDATE instance_link_requests
+              SET last_polled_at = ?
+            WHERE id = ? AND status = 'pending'
+              AND (last_polled_at IS NULL OR last_polled_at <= ?)`,
+        )
+        .bind(nowIso, id, cutoff)
+        .run()) as { meta?: { changes?: number } };
+      return (result.meta?.changes ?? 0) > 0;
+    },
+
+    async insertInstanceCredential(row) {
+      await d1
+        .prepare(
+          `INSERT INTO instance_credentials
+             (id, account_id, credential_sha256, link_request_id, created_at, last_used_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          row.id,
+          row.account_id,
+          row.credential_sha256,
+          row.link_request_id,
+          row.created_at,
+          row.last_used_at,
+          row.revoked_at,
+        )
+        .run();
+    },
+
+    async deliverInstanceCredential({ requestId, credential, nowIso }) {
+      if (credential.link_request_id !== requestId) return false;
+      if (typeof d1.batch !== "function") {
+        throw new Error("D1 batch is required for instance credential delivery");
+      }
+      const insert = d1
+        .prepare(
+          `INSERT INTO instance_credentials
+             (id, account_id, credential_sha256, link_request_id, created_at, last_used_at, revoked_at)
+           SELECT ?, ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM instance_link_requests
+                WHERE id = ? AND account_id = ? AND status = 'approved'
+             )`,
+        )
+        .bind(
+          credential.id,
+          credential.account_id,
+          credential.credential_sha256,
+          credential.link_request_id,
+          credential.created_at,
+          credential.last_used_at,
+          credential.revoked_at,
+          requestId,
+          credential.account_id,
+        );
+      const markDelivered = d1
+        .prepare(
+          `UPDATE instance_link_requests
+              SET status = 'delivered', delivered_at = ?
+            WHERE id = ? AND status = 'approved'`,
+        )
+        .bind(nowIso, requestId);
+      // Keep the credential this batch inserted, not the newest by created_at: a slower poll can
+      // commit after a faster one with an earlier clock read, and must not hand out a credential
+      // its own batch just revoked. The last delivery to commit wins; the instance holding the
+      // other one sees 401 on its next call and links again. Rotate only when this batch's insert
+      // happened (the id is fresh, so the row exists only then): a losing poll of the same request
+      // must not revoke what the winner already handed out.
+      const rotate = d1
+        .prepare(
+          `UPDATE instance_credentials SET revoked_at = ?
+            WHERE account_id = ? AND revoked_at IS NULL
+              AND id <> ?
+              AND EXISTS (
+                SELECT 1 FROM instance_credentials
+                 WHERE id = ? AND link_request_id = ?
+              )`,
+        )
+        .bind(nowIso, credential.account_id, credential.id, credential.id, requestId);
+      try {
+        const results = await d1.batch([insert, markDelivered, rotate]);
+        const marked = (results[1] as { meta?: { changes?: number } } | undefined)?.meta?.changes;
+        return marked === 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/UNIQUE constraint failed/i.test(message) && /link_request_id/i.test(message)) {
+          return false;
+        }
+        throw error;
+      }
+    },
+
+    async getActiveInstanceCredentialBySha(sha) {
+      const row = await d1
+        .prepare(
+          `SELECT * FROM instance_credentials
+            WHERE credential_sha256 = ? AND revoked_at IS NULL`,
+        )
+        .bind(sha)
+        .first<RawRow>();
+      return row === null ? null : mapInstanceCredential(row);
+    },
+
+    async revokeInstanceCredential(id, nowIso) {
+      await d1
+        .prepare(
+          `UPDATE instance_credentials SET revoked_at = ?
+            WHERE id = ? AND revoked_at IS NULL`,
+        )
+        .bind(nowIso, id)
+        .run();
+    },
+
+    async touchInstanceCredential(id, nowIso) {
+      await d1
+        .prepare(`UPDATE instance_credentials SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`)
+        .bind(nowIso, id)
+        .run();
+    },
+
     async insertPaymentOrder(row) {
       await d1
         .prepare(
           `INSERT INTO payment_orders
              (id, checkout_token_sha256, account_id, provider, out_trade_no, trade_no,
-              months, total_amount, status, created_at, expires_at, paid_at, fulfilled_at,
+              waffo_session_id, waffo_order_id, months, total_amount, status, created_at, expires_at, paid_at, fulfilled_at,
               closed_at, refunded_at, refund_request_no, last_notify_id, last_queried_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           row.id,
@@ -795,6 +1151,8 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
           row.provider,
           row.out_trade_no,
           row.trade_no,
+          row.waffo_session_id ?? null,
+          row.waffo_order_id ?? null,
           row.months,
           row.total_amount,
           row.status,
@@ -817,14 +1175,6 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
       return row === null ? null : mapPaymentOrder(row);
     },
 
-    async getPaymentOrderByCheckoutHash(sha256) {
-      const row = await d1
-        .prepare(`SELECT * FROM payment_orders WHERE checkout_token_sha256 = ?`)
-        .bind(sha256)
-        .first<RawRow>();
-      return row === null ? null : mapPaymentOrder(row);
-    },
-
     async getPaymentOrderByOutTradeNo(outTradeNo) {
       const row = await d1
         .prepare(`SELECT * FROM payment_orders WHERE out_trade_no = ?`)
@@ -833,17 +1183,73 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
       return row === null ? null : mapPaymentOrder(row);
     },
 
-    async getPaymentOrderByRefundRequestNo(requestNo) {
-      const row = await d1
-        .prepare(`SELECT * FROM payment_orders WHERE refund_request_no = ?`)
-        .bind(requestNo)
-        .first<RawRow>();
-      return row === null ? null : mapPaymentOrder(row);
+    async insertPaymentOrderWithinDailyLimit(row, options) {
+      const result = (await d1
+        .prepare(
+          `INSERT INTO payment_orders
+             (id, checkout_token_sha256, account_id, provider, out_trade_no, trade_no,
+              waffo_session_id, waffo_order_id, months, total_amount, status, created_at, expires_at, paid_at, fulfilled_at,
+              closed_at, refunded_at, refund_request_no, last_notify_id, last_queried_at)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE (SELECT COUNT(*) FROM payment_orders WHERE account_id = ? AND created_at >= ?) < ?`,
+        )
+        .bind(
+          row.id,
+          row.checkout_token_sha256,
+          row.account_id,
+          row.provider,
+          row.out_trade_no,
+          row.trade_no,
+          row.waffo_session_id ?? null,
+          row.waffo_order_id ?? null,
+          row.months,
+          row.total_amount,
+          row.status,
+          row.created_at,
+          row.expires_at,
+          row.paid_at,
+          row.fulfilled_at,
+          row.closed_at,
+          row.refunded_at,
+          row.refund_request_no,
+          row.last_notify_id,
+          row.last_queried_at,
+          row.account_id,
+          options.sinceIso,
+          options.limit,
+        )
+        .run()) as { meta?: { changes?: number } };
+      return result.meta?.changes === 1;
+    },
+
+    async listPaymentOrdersForReconciliation(provider, options) {
+      const rows = await d1
+        .prepare(
+          `SELECT * FROM payment_orders
+             WHERE provider = ?
+               AND status NOT IN ('refunded', 'closed')
+               AND (
+                 (status IN ('created', 'form_issued', 'pending') AND created_at >= ?)
+                 OR (status IN ('paid', 'fulfilled') AND created_at >= ?)
+               )
+             ORDER BY
+               CASE WHEN last_queried_at IS NULL THEN 0 ELSE 1 END ASC,
+               last_queried_at ASC,
+               created_at DESC,
+               id DESC
+             LIMIT ?`,
+        )
+        .bind(provider, options.unpaidSinceIso, options.settledSinceIso, options.limit)
+        .all<RawRow>();
+      return rows.results.map(mapPaymentOrder);
     },
 
     async updatePaymentOrder(id, patch) {
       const columns = [
         "trade_no",
+        "expires_at",
+        "waffo_session_id",
+        "waffo_order_id",
         "status",
         "paid_at",
         "fulfilled_at",
@@ -871,6 +1277,9 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
     async compareAndSetPaymentOrder(id, expected, patch) {
       const columns = [
         "trade_no",
+        "expires_at",
+        "waffo_session_id",
+        "waffo_order_id",
         "status",
         "paid_at",
         "fulfilled_at",
@@ -919,7 +1328,7 @@ export function createD1ConnectDb(d1: D1Database): ConnectDb {
           `UPDATE payment_orders
               SET last_queried_at = ?
             WHERE id = ?
-              AND status IN ('created', 'form_issued', 'pending')
+              AND status IN ('created', 'form_issued', 'pending', 'fulfilled')
               AND (last_queried_at IS NULL OR last_queried_at <= ?)`,
         )
         .bind(queriedAt, id, cutoff)
@@ -1037,6 +1446,8 @@ export function createMemoryConnectDb(): ConnectDb {
   const accounts = new Map<string, AccountRow>();
   const entitlements = new Map<string, EntitlementRow>();
   const paymentOrders = new Map<string, PaymentOrderRow>();
+  const instanceLinkRequests = new Map<string, InstanceLinkRequestRow>();
+  const instanceCredentials = new Map<string, InstanceCredentialRow>();
 
   return {
     async insertInvite(row) {
@@ -1199,21 +1610,69 @@ export function createMemoryConnectDb(): ConnectDb {
       ).length;
     },
 
-    async markEndpointRevoked(endpointId, at) {
+    async markEndpointRevoked(endpointId, at, reason) {
       const row = endpoints.get(endpointId);
       if (row === undefined) {
         return;
       }
       row.status = "revoked";
       row.revoked_at = at;
+      row.revoke_reason = reason;
     },
 
-    async markEndpointRevokeFailed(endpointId) {
+    async markEndpointRevokeFailed(endpointId, reason) {
       const row = endpoints.get(endpointId);
       if (row === undefined) {
         return;
       }
       row.status = "revoke_failed";
+      row.revoke_reason = reason;
+    },
+
+    async getRestorableEndpointByAccountId(accountId) {
+      for (const row of endpoints.values()) {
+        if (row.account_id === accountId && row.status === "active") return null;
+      }
+      const rows = [...endpoints.values()].filter((row) => row.account_id === accountId);
+      rows.sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id));
+      const newest = rows[0];
+      if (newest === undefined) return null;
+      const restorable =
+        (newest.status === "revoked" || newest.status === "revoke_failed") &&
+        (newest.revoke_reason === "expired" || newest.revoke_reason === "refunded");
+      return restorable ? { ...newest } : null;
+    },
+
+    async reactivateEndpoint(input) {
+      const row = endpoints.get(input.id);
+      if (row === undefined) return false;
+      if (row.status !== "revoked" || row.account_id !== input.accountId) return false;
+      for (const other of endpoints.values()) {
+        if (other.id !== row.id && other.account_id === input.accountId && other.status === "active") {
+          return false;
+        }
+      }
+      row.status = "active";
+      row.cf_tunnel_id = input.cfTunnelId;
+      row.cf_dns_record_id = input.cfDnsRecordId;
+      row.token_sha256 = input.tokenSha256;
+      row.cf_access_app_id = null;
+      row.cf_access_policy_id = null;
+      row.token_ciphertext = null;
+      row.token_shown_at = null;
+      row.last_seen_at = null;
+      row.revoked_at = null;
+      row.revoke_reason = null;
+      return true;
+    },
+
+    async finishFailedRevoke(input) {
+      const row = endpoints.get(input.id);
+      if (row === undefined) return false;
+      if (row.status !== "revoke_failed" || row.cf_tunnel_id !== input.cfTunnelId) return false;
+      row.status = "revoked";
+      row.revoked_at = input.at;
+      return true;
     },
 
     async deleteEndpoint(endpointId) {
@@ -1360,6 +1819,119 @@ export function createMemoryConnectDb(): ConnectDb {
       if (row !== undefined) row.last_login_at = at;
     },
 
+    async insertInstanceLinkRequest(row) {
+      if (instanceLinkRequests.has(row.id)) {
+        throw new Error(`UNIQUE constraint failed: instance_link_requests.id (${row.id})`);
+      }
+      for (const existing of instanceLinkRequests.values()) {
+        if (existing.poll_secret_sha256 === row.poll_secret_sha256) {
+          throw new Error(
+            `UNIQUE constraint failed: instance_link_requests.poll_secret_sha256 (${row.poll_secret_sha256})`,
+          );
+        }
+      }
+      instanceLinkRequests.set(row.id, { ...row });
+    },
+
+    async getInstanceLinkRequestById(id) {
+      const row = instanceLinkRequests.get(id);
+      return row === undefined ? null : { ...row };
+    },
+
+    async getInstanceLinkRequestByPollSecretSha(sha) {
+      for (const row of instanceLinkRequests.values()) {
+        if (row.poll_secret_sha256 === sha) return { ...row };
+      }
+      return null;
+    },
+
+    async deleteInstanceLinkRequestsExpiredBefore(cutoffIso, limit) {
+      if (limit <= 0) return 0;
+      const expired = [...instanceLinkRequests.values()]
+        .filter((row) => row.expires_at < cutoffIso)
+        .sort((a, b) => a.expires_at.localeCompare(b.expires_at) || a.id.localeCompare(b.id))
+        .slice(0, limit);
+      for (const row of expired) instanceLinkRequests.delete(row.id);
+      return expired.length;
+    },
+
+    async approveInstanceLinkRequest(id, accountId, nowIso) {
+      const row = instanceLinkRequests.get(id);
+      if (row === undefined || row.status !== "pending" || row.expires_at <= nowIso) return false;
+      row.status = "approved";
+      row.account_id = accountId;
+      row.approved_at = nowIso;
+      return true;
+    },
+
+    async touchInstanceLinkPoll(id, nowIso) {
+      const row = instanceLinkRequests.get(id);
+      if (row === undefined || row.status !== "pending") return false;
+      const cutoffMs = Date.parse(nowIso) - 2_000;
+      if (row.last_polled_at !== null && Date.parse(row.last_polled_at) > cutoffMs) return false;
+      row.last_polled_at = nowIso;
+      return true;
+    },
+
+    async insertInstanceCredential(row) {
+      if (instanceCredentials.has(row.id)) {
+        throw new Error(`UNIQUE constraint failed: instance_credentials.id (${row.id})`);
+      }
+      for (const existing of instanceCredentials.values()) {
+        if (existing.credential_sha256 === row.credential_sha256) {
+          throw new Error(
+            `UNIQUE constraint failed: instance_credentials.credential_sha256 (${row.credential_sha256})`,
+          );
+        }
+        if (existing.link_request_id === row.link_request_id) {
+          throw new Error(
+            `UNIQUE constraint failed: instance_credentials.link_request_id (${row.link_request_id})`,
+          );
+        }
+      }
+      instanceCredentials.set(row.id, { ...row });
+    },
+
+    async deliverInstanceCredential({ requestId, credential, nowIso }) {
+      const request = instanceLinkRequests.get(requestId);
+      if (credential.link_request_id !== requestId || request === undefined || request.status !== "approved" || request.account_id !== credential.account_id) {
+        return false;
+      }
+      for (const row of instanceCredentials.values()) {
+        if (row.link_request_id === requestId) return false;
+        if (row.id === credential.id || row.credential_sha256 === credential.credential_sha256) {
+          throw new Error(`UNIQUE constraint failed: instance_credentials (${row.id})`);
+        }
+      }
+      instanceCredentials.set(credential.id, { ...credential });
+      request.status = "delivered";
+      request.delivered_at = nowIso;
+      // Same rule as D1: the credential handed out now is the account's only active one.
+      for (const row of instanceCredentials.values()) {
+        if (row.account_id === credential.account_id && row.revoked_at === null && row.id !== credential.id) {
+          row.revoked_at = nowIso;
+        }
+      }
+      return true;
+    },
+
+    async getActiveInstanceCredentialBySha(sha) {
+      for (const row of instanceCredentials.values()) {
+        if (row.credential_sha256 === sha && row.revoked_at === null) return { ...row };
+      }
+      return null;
+    },
+
+    async revokeInstanceCredential(id, nowIso) {
+      const row = instanceCredentials.get(id);
+      if (row !== undefined && row.revoked_at === null) row.revoked_at = nowIso;
+    },
+
+    async touchInstanceCredential(id, nowIso) {
+      const row = instanceCredentials.get(id);
+      if (row !== undefined && row.revoked_at === null) row.last_used_at = nowIso;
+    },
+
     async insertPaymentOrder(row) {
       if (paymentOrders.has(row.id)) {
         throw new Error(`UNIQUE constraint failed: payment_orders.id (${row.id})`);
@@ -1390,13 +1962,6 @@ export function createMemoryConnectDb(): ConnectDb {
       return row === undefined ? null : { ...row };
     },
 
-    async getPaymentOrderByCheckoutHash(sha256) {
-      for (const row of paymentOrders.values()) {
-        if (row.checkout_token_sha256 === sha256) return { ...row };
-      }
-      return null;
-    },
-
     async getPaymentOrderByOutTradeNo(outTradeNo) {
       for (const row of paymentOrders.values()) {
         if (row.out_trade_no === outTradeNo) return { ...row };
@@ -1404,11 +1969,54 @@ export function createMemoryConnectDb(): ConnectDb {
       return null;
     },
 
-    async getPaymentOrderByRefundRequestNo(requestNo) {
-      for (const row of paymentOrders.values()) {
-        if (row.refund_request_no === requestNo) return { ...row };
+    async insertPaymentOrderWithinDailyLimit(order, options) {
+      let count = 0;
+      for (const existingRow of paymentOrders.values()) {
+        if (existingRow.account_id === order.account_id && existingRow.created_at >= options.sinceIso) count += 1;
       }
-      return null;
+      if (count >= options.limit) return false;
+      if (paymentOrders.has(order.id)) {
+        throw new Error(`UNIQUE constraint failed: payment_orders.id (${order.id})`);
+      }
+      for (const existing of paymentOrders.values()) {
+        if (existing.checkout_token_sha256 === order.checkout_token_sha256) {
+          throw new Error("UNIQUE constraint failed: payment_orders.checkout_token_sha256");
+        }
+        if (existing.out_trade_no === order.out_trade_no) {
+          throw new Error("UNIQUE constraint failed: payment_orders.out_trade_no");
+        }
+        if (order.trade_no !== null && existing.trade_no === order.trade_no) {
+          throw new Error("UNIQUE constraint failed: payment_orders.trade_no");
+        }
+        if (order.refund_request_no !== null && existing.refund_request_no === order.refund_request_no) {
+          throw new Error("UNIQUE constraint failed: payment_orders.refund_request_no");
+        }
+      }
+      paymentOrders.set(order.id, { ...order });
+      return true;
+    },
+
+    async listPaymentOrdersForReconciliation(provider, options) {
+      return [...paymentOrders.values()]
+        .filter(
+          (row) =>
+            row.provider === provider &&
+            row.status !== "refunded" &&
+            row.status !== "closed" &&
+            ((row.status === "created" || row.status === "form_issued" || row.status === "pending")
+              ? row.created_at >= options.unpaidSinceIso
+              : (row.status === "paid" || row.status === "fulfilled") && row.created_at >= options.settledSinceIso),
+        )
+        .sort((a, b) => {
+          const aQueried = a.last_queried_at === null ? 0 : 1;
+          const bQueried = b.last_queried_at === null ? 0 : 1;
+          return aQueried - bQueried
+            || (a.last_queried_at ?? "").localeCompare(b.last_queried_at ?? "")
+            || b.created_at.localeCompare(a.created_at)
+            || b.id.localeCompare(a.id);
+        })
+        .slice(0, options.limit)
+        .map((row) => ({ ...row }));
     },
 
     async updatePaymentOrder(id, patch) {
@@ -1471,7 +2079,7 @@ export function createMemoryConnectDb(): ConnectDb {
     async claimPaymentOrderQuery(id, queriedAt, cutoff) {
       const row = paymentOrders.get(id);
       const queryable =
-        row?.status === "created" || row?.status === "form_issued" || row?.status === "pending";
+        row?.status === "created" || row?.status === "form_issued" || row?.status === "pending" || row?.status === "fulfilled";
       if (
         row === undefined ||
         !queryable ||

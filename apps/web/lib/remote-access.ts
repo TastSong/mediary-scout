@@ -1,3 +1,8 @@
+import { createHash } from "node:crypto";
+import { hostname as containerHostname } from "node:os";
+import { getConnectBoundEnv, getConnectHostname, getConnectTunnelToken } from "./connect-link-store";
+export { remoteFirstSetupNotice, type LoginBootstrap } from "./remote-access-copy";
+
 /**
  * 实例侧「远程访问」状态解析。纯逻辑 + 依赖注入，node 环境可测。
  *
@@ -235,6 +240,37 @@ export function instanceTunnelToken(): string | undefined {
 }
 
 /**
+ * Fingerprint of the web container and the tunnel env it runs with (token and hostname,
+ * normalized). A binding made from the settings page records it, see `storedBindingIsCurrent`.
+ * The container part is its hostname, which Docker sets to the container id: the same across a
+ * restart, new when the container is recreated.
+ */
+export function instanceEnvFingerprint(container: string = containerHostname()): string {
+  const token = process.env.TUNNEL_TOKEN?.trim() ?? "";
+  const hostname = process.env.MEDIARY_CONNECT_HOSTNAME?.trim().toLowerCase() ?? "";
+  return createHash("sha256").update(`${container}\n${token}\n${hostname}`).digest("hex");
+}
+
+/**
+ * A binding made from the settings page beats the env web is running with for as long as web is
+ * the same container with the same env: 「接入」 rewrites .env and recreates only cloudflared, and
+ * restarting web (crash, host reboot) keeps the container and the env it was created with.
+ * Recreating web (an update, connect.sh, docker compose up) gives a new container, reading .env
+ * afresh, and then the env wins — even when it happens to equal the env at binding time.
+ */
+async function storedBindingIsCurrent(): Promise<boolean> {
+  const boundEnv = await getConnectBoundEnv();
+  return boundEnv !== null && boundEnv === instanceEnvFingerprint();
+}
+
+/** Resolve the token without requiring a web-container restart after in-app binding. */
+export async function resolveInstanceTunnelToken(): Promise<string | undefined> {
+  const stored = (await getConnectTunnelToken())?.trim() || undefined;
+  if (stored && (await storedBindingIsCurrent())) return stored;
+  return instanceTunnelToken();
+}
+
+/**
  * 用户控制台入口（登录页即入口，魔法链接无密码）。
  *
  * 从 `scoutConnectBaseUrl()` 派生而非再写死一个生产域名：本模块的既定设计就是
@@ -259,14 +295,30 @@ export function consoleUrl(): string {
  * 在函数里读 env(cacheComponents 下模块顶层求值会把构建期 env 烤进产物)。
  * 校验成 hostname 形状(DNS 字符集,无协议无路径)防 env 被塞怪东西。 */
 export function instanceConnectHostname(): string | null {
-  const raw = process.env.MEDIARY_CONNECT_HOSTNAME?.trim().toLowerCase();
+  return parseInstanceConnectHostname(process.env.MEDIARY_CONNECT_HOSTNAME);
+}
+
+function parseInstanceConnectHostname(value: string | null | undefined): string | null {
+  const raw = value?.trim().toLowerCase();
   if (!raw) return null;
   // 逐 label 校验:每段以字母数字开头结尾、中间可含连字符,最后一段是 TLD。
   // 宽松的 /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/ 会放过 `a..b.com`、`a-.b.com`
   // 这类非法 DNS 形状——虽然不危险,但会渲染出点了就坏的链接。
-  const LABEL = "[a-z0-9](?:[a-z0-9-]*[a-z0-9])?";
-  const HOSTNAME_RE = new RegExp(`^(?:${LABEL}\\.)+[a-z]{2,}$`);
+  // Same contract as connect-client and the updater's /tunnel check.
+  const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+  const HOSTNAME_RE = new RegExp(`^(?:${LABEL}\\.)+[a-z]{2,63}$`);
   return HOSTNAME_RE.test(raw) ? raw : null;
+}
+
+/** Resolve the hostname without requiring a web-container restart after in-app binding. */
+export async function resolveInstanceConnectHostname(): Promise<string | null> {
+  if (await storedBindingIsCurrent()) {
+    const stored = parseInstanceConnectHostname(await getConnectHostname());
+    if (stored) return stored;
+  }
+  // Otherwise the env, even when malformed: the same null the sync reader returns, instead of
+  // silently shadowing an invalid deployment configuration.
+  return instanceConnectHostname();
 }
 
 /**
@@ -281,6 +333,15 @@ export function accountPasswordHref(w?: string): string {
   const params = new URLSearchParams({ tab: "account" });
   if (w) params.set("w", w);
   return `/settings?${params.toString()}#password`;
+}
+
+/**
+ * 「去设置密码」按钮的去处。单用户实例的设置页没有密码表单(改密表单只在已设过
+ * 密码时出现在远程访问区块里),第一次设密码的表单在 /login —— 局域网里打开它就是
+ * 「设置访问密码」屏。多用户仍去账号 tab 的改密区。
+ */
+export function passwordSetupHref(opts: { multiUser: boolean; w?: string | undefined }): string {
+  return opts.multiUser ? accountPasswordHref(opts.w) : "/login";
 }
 
 // ─────────────────────────────────────────────────────────────────────────

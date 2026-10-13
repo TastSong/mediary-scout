@@ -2,9 +2,9 @@
 
 ## 定价
 
-Last updated: 2026-08-16
+Last updated: 2026-10-04
 
-最后更新:2026-08-16
+最后更新:2026-10-04
 
 ## Prepaid time, never auto-charged
 
@@ -26,9 +26,9 @@ Mediary Connect 按**预付时长**计费:一次付费,获得对应月数的远�
 - **年度(12 个月)** — ¥108
 - **两年(24 个月)** — ¥188
 
-Prices are in CNY. Checkout is handled through **Alipay only**. Each purchase is a one-time payment and never starts an automatic renewal.
+Prices are in CNY. Checkout is handled by **Waffo.com Limited**, our merchant of record, through WeChat Pay. Waffo sends the payment receipt. Each purchase is a one-time payment and never starts an automatic renewal.
 
-价格以人民币计,**仅支持支付宝**结账。每次购买都是一次性付款,不会开通自动续费。
+价格以人民币计,由记录商户 **Waffo.com Limited** 通过微信支付处理结账。付款凭证由 Waffo 发送。每次购买都是一次性付款,不会开通自动续费。
 
 ## Every tier includes
 
@@ -52,11 +52,11 @@ Prices are in CNY. Checkout is handled through **Alipay only**. Each purchase is
 
 - A **7-day grace period** after expiry, service as usual, with in-app and email renewal reminders;
 - After grace, the hostname stops resolving (your instance itself is unaffected);
-- When grace ends, the tunnel is reclaimed immediately to free capacity. Your slug is **never released to others** — renewing restores the same address (you re-run the one-line setup command once to bring the tunnel back up).
+- When grace ends, the tunnel is reclaimed immediately to free capacity. Your slug is **never released to others** — renewing restores the same address (after paying, click 恢复原地址 (Restore) in the console or in your instance's settings, then connect once more to bring the tunnel back up).
 
 - 到期后 **7 天宽限期**,服务照常,站内与邮件提醒续期;
 - 宽限期后域名停止解析(你的实例本身不受任何影响);
-- 宽限期满即回收隧道以释放配额;你的 slug **永不释放给他人** —— 续期后地址原样恢复(需重跑一次一行接入命令让隧道重新上线)。
+- 宽限期满即回收隧道以释放配额;你的 slug **永不释放给他人** —— 续期后地址原样恢复(付款后在控制台或实例设置里点「恢复原地址」,再接入一次让隧道重新上线)。
 
 ## Buying: you log in first
 
@@ -78,13 +78,13 @@ Mediary Connect is an **add-on** to Mediary Scout, not a standalone product. It 
 
 - It does **not** host an instance for you — you need your own always-on machine (NAS, router-class box, mini PC, an old laptop all work).
 - It does **not** search or download anything on your behalf; your own Scout does that.
-- It does **not** hold your instance's access password — that gate is Scout's own, set by you on first open, and we keep no copy.
+- It does **not** hold your instance's access password — that gate is Scout's own, set by you from your home network, and we keep no copy.
 
 Mediary Connect 是 Mediary Scout 的**附加服务**,不是独立产品。它需要一个已经在运行的 Scout 实例才有东西可连。
 
 - **不**为你托管实例 —— 你需要自己有一台常开的机器(NAS、软路由、迷你主机、旧笔记本都行)。
 - **不**代你搜索或下载任何东西,那是你自己的 Scout 在做。
-- **不**持有你实例的访问密码 —— 那道门禁是 Scout 自己的,首次打开时由你设定,我们这边没有副本。
+- **不**持有你实例的访问密码 —— 那道门禁是 Scout 自己的,由你在家里的局域网里设定,我们这边没有副本。
 
 ## Changing tiers, and price changes
 

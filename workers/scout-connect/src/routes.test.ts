@@ -80,6 +80,7 @@ function makeDeps(db: ConnectDb, cf: CfApi): RouteDeps {
     newEntitlementId: seq("ent"),
     sessionSecret: "f".repeat(64),
     sendMagicLink: async () => {},
+    sendInstanceLinkEmail: async () => {},
   };
 }
 
@@ -659,8 +660,25 @@ describe("handleRequest", () => {
     const endpoint = await db.getEndpointById(endpointId ?? "");
     expect(endpoint?.status).toBe("revoked");
     expect(endpoint?.revoked_at).toBe(NOW);
+    expect(endpoint?.revoke_reason).toBe("admin");
     const invite = await db.getInviteById(endpoint?.invite_id ?? "");
     expect(invite?.status).toBe("revoked");
+  });
+
+  it("revoke retry of a failed expiry/refund cleanup keeps why the address was taken down", async () => {
+    // An admin finishing a failed cleanup is not an admin revoke: the owner must still be
+    // able to get the address back after renewing.
+    const { db, deps } = setup();
+    await seedProvisioned(deps);
+    const endpointId = (await db.listEndpoints())[0]?.id ?? "";
+    await db.markEndpointRevokeFailed(endpointId, "expired");
+
+    const res = await handleRequest(adminPost(`/api/admin/endpoints/${endpointId}/revoke`), deps);
+    expect(res.status).toBe(200);
+
+    const endpoint = await db.getEndpointById(endpointId);
+    expect(endpoint?.status).toBe("revoked");
+    expect(endpoint?.revoke_reason).toBe("expired");
   });
 
   it("GET /i/unknown → 链接无效 page", async () => {
@@ -2368,37 +2386,39 @@ describe("POST /waitlist Turnstile gate", () => {
   });
 });
 
-describe("GET /buy — Alipay-only tier selector", () => {
-  it("serves the three unchanged Alipay tiers", async () => {
+describe("GET /buy — Waffo tier selector", () => {
+  it("serves the three unchanged Waffo tiers", async () => {
     const res = await handleRequest(new Request(`${BASE}/buy`), {
       ...setup().deps,
-      alipayApi: { pagePayForm: async () => "" } as never,
+      waffoApi: { config: {}, createSession: async () => ({ checkoutUrl: "", sessionId: "", expiresAt: "" }), verifyWebhook: async () => ({ eventType: "" }), queryPayments: async () => [] } as never,
+      waffoProducts: { quarter: "q", year: "y", two_years: "2y" },
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     const body = await res.text();
-    expect(body).toContain("支付宝支付");
+    expect(body).toContain("微信支付");
     expect(body).toContain("¥45");
     expect(body).toContain("¥108");
     expect(body).toContain("¥188");
   });
 
-  it("未配置支付宝服务端时仍 200 且明确禁用(不是白页/不是 500)", async () => {
+  it("未配置 Waffo 服务端时仍 200 且明确禁用(不是白页/不是 500)", async () => {
     const res = await handleRequest(new Request(`${BASE}/buy`), setup().deps);
     expect(res.status).toBe(200);
     const body = await res.text();
-    expect(body).toContain("支付宝结账暂未开放");
+    expect(body).toContain("微信支付结账暂未开放");
     expect(body).toContain("disabled");
   });
 
-  it("页面只依赖支付宝服务端配置，不包含第三方浏览器 SDK", async () => {
+  it("页面只依赖 Waffo 服务端配置，不包含第三方浏览器 SDK", async () => {
     const res = await handleRequest(new Request(`${BASE}/buy`), {
       ...setup().deps,
-      alipayApi: { pagePayForm: async () => "" } as never,
+      waffoApi: { config: {}, createSession: async () => ({ checkoutUrl: "", sessionId: "", expiresAt: "" }), verifyWebhook: async () => ({ eventType: "" }), queryPayments: async () => [] } as never,
+      waffoProducts: { quarter: "q", year: "y", two_years: "2y" },
     });
     const body = await res.text();
-    expect(body).not.toContain("Paddle");
-    expect(body).not.toContain("paddle.com");
+    expect(body).not.toContain("Alipay");
+    expect(body).not.toContain("支付宝");
     expect(body).not.toContain("<script src=");
   });
 });
@@ -2455,6 +2475,7 @@ describe("容量满时 admin invite 路径也必须是 503", () => {
         grace_until: null,
         suspended_at: null,
         purge_after: null,
+        revoke_reason: null,
       });
     }
     const createRes = await createInviteViaApi(deps, { email: "cap@example.com", slug: "capped" });

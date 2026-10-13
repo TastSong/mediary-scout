@@ -38,11 +38,13 @@ export function consolePage(input: {
    *  推:控制台可从 beta 子域访问,host 会是 beta.<root>,后缀就错了。 */
   rootDomain: string;
   now: string;
-  /** 可下单档位。空数组 = 支付宝配置不完整,页面不给假按钮。 */
+  /** 可下单档位。空数组 = Waffo 配置不完整,页面不给假按钮。 */
   tiers?: readonly PurchasableTier[];
   /** 隧道配额是否已满(CF 1000 硬上限)。只影响「已付费未开通」态:满了就不给
    *  slug 表单,免得用户填完名字才吃 503。已开通用户完全不受影响。 */
   atCapacity?: boolean;
+  /** 到期或退款收回、账号自己还能要回来的地址。没有 active 行时才有。 */
+  restorable?: { slug: string; hostname: string } | null;
 }): string {
   const expiry = latestExpiry(input.entitlements);
   const active = isEntitlementActive(expiry, input.now);
@@ -165,20 +167,27 @@ function renderBody(
     now: string;
     /** 隧道配额已满(CF 1000 硬上限)。已开通用户不受影响,只挡新开通。 */
     atCapacity: boolean;
-    /** 可下单档位(固定支付宝档位,空数组=购买通道未配置)。 */
+    /** 可下单档位(固定 Waffo 档位,空数组=购买通道未配置)。 */
     tiers: readonly PurchasableTier[];
+    /** 到期或退款收回、还能要回来的地址。 */
+    restorable?: { slug: string; hostname: string } | null;
   },
   active: boolean,
 ): string {
+  const renewalNote = input.restorable
+    ? `<p class="lead-sub">续期后，<span class="addr">${esc(input.restorable.hostname)}</span> 会原样恢复。</p>`
+    : "";
   if (!active) {
     if (input.tiers.length === 0) {
-      // 支付宝凭证未完整配置:不给假按钮,老实说不可用。
+      // Waffo 配置未完整:不给假按钮,老实说不可用。
       return `<p class="sub">你还没有有效时长。</p>
-<p class="lead-sub">购买通道暂时不可用,请稍后再试或<a href="/contact">联系我们</a>。</p>`;
+<p class="lead-sub">购买通道暂时不可用,请稍后再试或<a href="/contact">联系我们</a>。</p>
+${renewalNote}`;
     }
     return `<p class="sub">你还没有有效时长。开通后即可为自托管实例生成专属远程访问地址。</p>
+${renewalNote}
 <p style="margin:14px 0 0;padding:12px 14px;border:1px solid #f59e0b;border-radius:10px;background:rgba(245,158,11,.08);color:var(--text);font-size:13px;line-height:1.7">
-付款会跳转支付宝。浏览器返回本站不代表已经到账，以服务端验签通知或主动查单结果为准；请在付款确认页等待，不要重复付款。
+付款会跳转到 Waffo 的微信支付页面。浏览器返回本站不代表已经到账，以服务端确认结果为准；请在付款确认页等待，不要重复付款。
 </p>
 <div class="tiers">
 ${input.tiers
@@ -194,7 +203,7 @@ ${t.featured ? `<span class="tier-tag">推荐</span>` : ""}
 </div>
 <p class="msg" id="buymsg" hidden></p>
 <p class="lead-sub" style="margin-top:14px">预付时长,不自动续费。买多次会叠加到同一个账号,到期日往后延。<br>
-使用<strong>支付宝</strong>一次性付款。<br>
+使用<strong>微信支付</strong>一次性付款，订单由记录商户 Waffo.com Limited 处理。<br>
 14 天内无条件全额退款 —— 见<a href="/refund">退款政策</a>。</p>`;
   }
   if (input.endpoint === null && input.atCapacity) {
@@ -207,6 +216,16 @@ ${t.featured ? `<span class="tier-tag">推荐</span>` : ""}
 <p class="lead">隧道配额已满</p>
 <p class="lead-sub">我们的 Cloudflare 隧道配额（每账号上限 1000 条，所有套餐一致）已用尽，暂时无法为新实例分配地址。你的时长不会流失——配额释放后回到这里即可开通，我们也会邮件通知你。</p>
 <p class="lead-sub">如果不想等，14 天内可无条件全额退款：<a href="/refund">退款政策</a> · <a href="/contact">联系我们</a></p>
+</div>`;
+  }
+  if (input.endpoint === null && input.restorable) {
+    return `<p class="sub">你的专属地址 <span class="addr">${esc(input.restorable.hostname)}</span> 还为你保留着。</p>
+<div class="panel">
+<p class="step">恢复地址</p>
+<p class="lead">恢复后再接入一次即可</p>
+<p class="lead-sub">会为这个地址重新开一条隧道。恢复后这里会给出接入命令，或在实例的「设置 → 远程访问」里点「接入」。</p>
+<button class="btn" id="restore" type="button">恢复原地址</button>
+<p class="msg" id="restoremsg" hidden></p>
 </div>`;
   }
   if (input.endpoint === null) {
@@ -241,11 +260,11 @@ ${lastSeenHtml(input.endpoint.last_seen_at, input.now)}
 }
 
 /**
- * 档位按钮 → 创建本地订单 → 跳同源一次性 checkout hop → 提交支付宝表单。
+ * 档位按钮 → 创建本地订单 → 跳转 Waffo checkout 页面。
  *
  * ## 失败必须说话
  *
- * 三种真实失败:503(购买通道未配置)、502(支付宝上游失败)、401(session 过期)。
+ * 三种真实失败:503(购买通道未开放,或 Waffo 上游暂时失败)、401(session 过期)、429(次数过多)。
  * 每种都给不同的下一步动作 —— 「请重试」对 session 过期毫无用处。
  * 不回显后端的原始错误(可能含内部细节)。
  */
@@ -260,20 +279,21 @@ btns.forEach((btn)=>btn.addEventListener("click",async()=>{
   btns.forEach(b=>b.disabled=true);
   btn.dataset.busy="1";
   try{
-    const res=await fetch("/api/alipay/checkout",{
+    const res=await fetch("/api/checkout",{
       method:"POST",
       headers:{"content-type":"application/json"},
       body:JSON.stringify({tier:btn.dataset.tier}),
     });
     if(res.status===401){fail("登录状态已过期。刷新页面重新登录后再试。");return;}
     if(res.status===503){fail("购买通道暂时不可用。请稍后再试,或联系我们。");return;}
+    if(res.status===429){fail("发起支付的次数太多了。请过几个小时再试;若需要帮助请联系我们。");return;}
     if(!res.ok){fail("发起支付失败了。稍后再试一次;若一直失败请联系我们。");return;}
     const data=await res.json();
-    if(typeof data.checkout_url!=="string"||data.checkout_url===""){
+    if(typeof data.checkoutUrl!=="string"||data.checkoutUrl===""){
       fail("发起支付失败了。稍后再试一次;若一直失败请联系我们。");return;
     }
-    // 同源 hop 持有一次性能力 token，随后 POST 表单到支付宝。
-    window.location.href=data.checkout_url;
+    // 必须在当前标签页打开，微信支付在手机上依赖原页面上下文；新标签页还会触发弹窗拦截。
+    window.location.assign(data.checkoutUrl);
   }catch{
     // 网络断了/请求被拦。不能静默 —— 用户会以为按钮坏了然后反复点。
     fail("网络请求没成功。检查网络后再试一次。");
@@ -330,6 +350,26 @@ function relativeZh(iso: string | null, now: number): string | null {
   return "很久以前";
 }
 
+/** 有可恢复地址时的「恢复原地址」按钮:同 slug 走 /api/provision,成功刷新进接入面板。 */
+function restoreScript(slug: string): string {
+  return `<script type="module">
+const btn=document.getElementById("restore"),msg=document.getElementById("restoremsg");
+function fail(text){msg.textContent=text;msg.className="msg err";msg.hidden=false;btn.disabled=false;}
+btn.addEventListener("click",async()=>{
+  btn.disabled=true;msg.hidden=true;
+  try{
+    const res=await fetch("/api/provision",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({slug:${JSON.stringify(slug)}})});
+    if(res.ok){window.location.reload();return;}
+    if(res.status===401){fail("登录状态已过期。刷新页面重新登录后再试。");return;}
+    if(res.status===402){fail("时长还没生效。付款确认后刷新页面再试。");return;}
+    if(res.status===409){window.location.reload();return;}
+    if(res.status===503){fail("暂时恢复不了，请过几分钟再试；一直不行请联系我们。");return;}
+    fail("恢复没成功，请稍后再试；一直不行请联系我们。");
+  }catch{fail("网络请求没成功。检查网络后再试一次。");}
+});
+</script>`;
+}
+
 /** active 时才需要客户端脚本:有 endpoint → 取码/复制;无 endpoint → slug
  *  选择表单(实时查重 + 开通)。 */
 function renderScript(
@@ -339,6 +379,7 @@ function renderScript(
     rootDomain: string;
     atCapacity?: boolean;
     tiers?: readonly PurchasableTier[];
+    restorable?: { slug: string; hostname: string } | null;
   },
   active: boolean,
 ): string {
@@ -350,6 +391,7 @@ function renderScript(
   // 满容量时 renderBody 不渲染 #slug/#provision,注入表单脚本会对 null 调
   // addEventListener 直接抛错、整段脚本崩掉。条件必须与 renderBody 的分支一致。
   if (input.endpoint === null && input.atCapacity === true) return "";
+  if (input.endpoint === null && input.restorable) return restoreScript(input.restorable.slug);
   if (input.endpoint === null) return slugFormScript(input.rootDomain);
   return `<script type="module">
 const $=(id)=>document.getElementById(id);

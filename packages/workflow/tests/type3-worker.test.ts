@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
 import {
   createEpisodeStates,
@@ -277,6 +277,86 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(saved?.season.latestAiredEpisode).toBe(4);
   });
 
+  it("heals an inflated season before patrol and never invokes the agent", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title } = trackedFixture("inflated");
+    const season: TrackedSeason = {
+      ...trackedFixture("inflated").season,
+      id: `${title.id}_s1`,
+      mediaTitleId: title.id,
+      totalEpisodes: 14,
+      latestAiredEpisode: 14,
+    };
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: () => "2026-06-12T00:00:01.000Z",
+      createWorkflowRunId: () => "run_heal_type3",
+      syncSeasonMetadata: async () => ({ latestAiredEpisode: 1, totalEpisodes: 14 }),
+    });
+
+    expect(outcomes).toEqual([
+      { trackedSeasonId: season.id, status: "ran", workflowRunId: "run_heal_type3", workflowStatus: "succeeded" },
+    ]);
+    const saved = await repository.getWorkflowRunSnapshot("run_heal_type3");
+    expect(saved?.season.latestAiredEpisode).toBe(1);
+    const persisted = (await repository.listAllTrackedSeasonStates()).find((state) => state.season.id === season.id);
+    expect(persisted?.season.latestAiredEpisode).toBe(1);
+    expect(persisted?.episodes.find((episode) => episode.episodeCode === "S01E02")).toMatchObject({
+      airStatus: "unaired",
+      obtained: false,
+    });
+    const patrol = (await repository.listNotifications()).find(
+      (notification) => notification.workflowRunId === "run_heal_type3",
+    );
+    expect(patrol?.kind).toBe("already_current");
+  });
+
+  it("warns when metadata sync fails and continues with the stored counts", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title } = trackedFixture("sync-error");
+    const season: TrackedSeason = {
+      ...trackedFixture("sync-error").season,
+      totalEpisodes: 4,
+      latestAiredEpisode: 2,
+    };
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01", "S01E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const outcomes = await runScheduledType3Monitoring({
+        repository,
+        resourceProvider: emptyProvider(),
+        storage,
+        model: throwingModel(),
+        storageParentDirectoryId: "library_root",
+        now: fixedNow,
+        createWorkflowRunId: () => "run_sync_error_type3",
+        syncSeasonMetadata: async () => {
+          throw new Error("TMDB metadata unavailable");
+        },
+      });
+
+      expect(outcomes[0]).toMatchObject({ status: "ran", workflowRunId: "run_sync_error_type3" });
+      const saved = await repository.getWorkflowRunSnapshot("run_sync_error_type3");
+      expect(saved?.season).toMatchObject({ totalEpisodes: 4, latestAiredEpisode: 2 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("tmdbId=1"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("season=1"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("TMDB metadata unavailable"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("records a no-op run when a tracked season is already current — the agent model is never invoked", async () => {
     const repository = new InMemoryWorkflowRepository();
     const { title, season } = trackedFixture();
@@ -424,6 +504,11 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(outcomes[0]).toMatchObject({ trackedSeasonId: `${movie.id}_movie`, status: "ran", workflowRunId: "run_movie_patrol" });
     const saved = await repository.getWorkflowRunSnapshot("run_movie_patrol");
     expect(saved?.workflowRun.kind).toBe("movie_init");
+    // Like the shows it patrols, the film reports into the daily digest instead of
+    // pushing on its own every sweep, and still reads as not found (not 已是最新).
+    expect(saved?.notifications.map((notification) => [notification.kind, notification.trigger])).toEqual([
+      ["no_coverage", "scheduled"],
+    ]);
 
     const held = await runScheduledType3Monitoring({
       repository,

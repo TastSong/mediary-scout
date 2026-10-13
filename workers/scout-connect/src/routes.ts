@@ -3,6 +3,7 @@ import type { AccountRow, ConnectDb, PaymentOrderRow } from "./db.js";
 import { HttpError, handleError, htmlPage, json } from "./http.js";
 import { requireAdmin } from "./auth.js";
 import { provisionEndpoint } from "./provision.js";
+import { restoreEndpoint } from "./restore.js";
 import { revokeEndpoint } from "./revoke.js";
 import { revealByCode } from "./reveal.js";
 import {
@@ -34,21 +35,26 @@ import { newId } from "./ids.js";
 import { sha256Hex } from "./crypto-token.js";
 import { signToken, verifyToken } from "./signed-token.js";
 import { buildSessionCookie, parseSessionCookie } from "./session.js";
-import { computeExpiry, isEntitlementActive, latestExpiry } from "./entitlement.js";
-import type { AlipayApi } from "./alipay-api.js";
-import { ALIPAY_TIERS, resolveAlipayTier } from "./alipay-order.js";
+import { confirmLoginPage } from "./html/confirm-login-page.js";
+import { computeExpiry, isEntitlementActive, latestExpiry, reconcileEntitlementLedger } from "./entitlement.js";
+import type { WaffoApi, WaffoEnvironment, WaffoPayment } from "./waffo-api.js";
 import {
-  acceptAlipayNotification,
-  closeAlipayOrder,
-  compensateAlipayOrder,
-  InvalidAlipayEvidenceError,
-  IgnoredAlipayNotificationError,
-  AlipayOperationError,
-  queryAlipayRefund,
-  requestFullAlipayRefund,
-  type AlipayRefundDeps,
-  type AlipayServiceDeps,
-} from "./alipay-service.js";
+  assertWaffoCompletedEvidence,
+  InvalidWaffoEvidenceError,
+  isWaffoFullRefund,
+  normalizeWaffoAmount,
+  readWaffoCompletedEvidence,
+} from "./waffo-service.js";
+import { PAYMENT_TIERS, resolvePaymentTier, canTransitionPaymentOrder } from "./payment-order.js";
+import { isWaffoNotApprovedError } from "./waffo-api.js";
+import { resolveAccount } from "./account-auth.js";
+import {
+  startInstanceLink,
+  instanceLinkLanding,
+  confirmInstanceLink,
+  pollInstanceLink,
+  revokeInstanceLink,
+} from "./instance-link.js";
 
 // Same aperture mark as apps/web/app/icon.svg — the product brand.
 const LOGO_SVG =
@@ -70,17 +76,19 @@ export interface RouteDeps {
   // turnstileSitekeyIfConfigured() / turnstileGateEnabled() below;
   // either absent → no widget rendered, POST /waitlist skips verification.
   turnstileSitekey?: string | undefined;
-  /** Alipay server API. Missing configuration keeps new checkout fail-closed. */
-  alipayApi?: AlipayApi | undefined;
-  alipayAppId?: string | undefined;
-  alipaySellerId?: string | undefined;
-  /** Sandbox is accepted only by local Worker wiring; production stays pinned to production. */
-  alipayEnvironment?: "production" | "sandbox" | undefined;
+  /** Waffo server API. Missing configuration keeps new checkout fail-closed. */
+  waffoApi?: WaffoApi | undefined;
+  waffoEnvironment?: WaffoEnvironment | undefined;
+  waffoStoreId?: string | undefined;
+  waffoProducts?: {
+    quarter: string;
+    year: string;
+    two_years: string;
+  } | undefined;
   /** Deterministic injection points for checkout tests; production uses crypto randomness. */
   newPaymentOrderId?: (() => string) | undefined;
-  newAlipayOutTradeNo?: (() => string) | undefined;
+  newWaffoExternalId?: (() => string) | undefined;
   newCheckoutToken?: (() => string) | undefined;
-  newAlipayRefundRequestNo?: (() => string) | undefined;
   turnstileSecret?: string | undefined;
   // P3: 魔法链接登录
   newAccountId: () => string;
@@ -88,6 +96,11 @@ export interface RouteDeps {
   sessionSecret: string;
   /** 发一封含魔法链接的邮件。注入以便测试不打真 Resend。 */
   sendMagicLink: (to: string, url: string) => Promise<void>;
+  /** 发一封含实例连接确认链接的邮件。 */
+  sendInstanceLinkEmail: (
+    to: string,
+    details: { url: string; verifyCode: string; requestIp: string; requestedAt: string },
+  ) => Promise<void>;
 }
 
 // slug/check 限流器,worker 实例生命周期内有效(单实例内存窗口,
@@ -196,9 +209,9 @@ export async function handleRequest(request: Request, deps: RouteDeps): Promise<
  */
 export const MAX_JSON_BODY_BYTES = 8 * 1024;
 /**
- * 支付异步通知的 body 上限,比普通 API 请求宽。
+ * Waffo 支付异步通知的 body 上限,比普通 API 请求宽。
  *
- * 支付宝 form notification 通常很小，但未来字段扩展和签名值会增加体积。
+ * Waffo webhook 通常很小，但未来字段扩展和签名值会增加体积。
  * **上限设太紧会拒掉真实付款通知 —— 那是
  * 直接丢钱**,所以留足余量。仍然要有上限:webhook 端点公开可打,裸
  * request.text() 会把 500MB body 全缓存进内存(readBodyTextCapped 的注释里
@@ -276,7 +289,7 @@ async function readBodyTextCapped(
   return new TextDecoder().decode(joined);
 }
 
-async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+export async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
   assertDeclaredSizeWithinCap(request);
   const text = await readBodyTextCapped(request);
   if (text.trim() === "") {
@@ -307,6 +320,23 @@ function decodeParam(s: string): string {
     return decodeURIComponent(s);
   } catch {
     throw new HttpError(400, "bad encoding");
+  }
+}
+
+/**
+ * Session-cookie POSTs must come from this origin. Every customer instance is
+ * served on <slug>.<root> and its owner controls what that origin serves; a
+ * page there is same-site with the apex, so SameSite=Lax still attaches the
+ * session cookie to its POSTs (and a text/plain body skips the CORS preflight).
+ * Browsers that send Fetch Metadata state the relationship directly; older ones
+ * still send Origin on every POST. A request with neither header did not come
+ * from a browser page, so no ambient cookie was attached on someone's behalf.
+ */
+export function assertSameOriginRequest(request: Request, url: URL): void {
+  const site = request.headers.get("sec-fetch-site");
+  const origin = request.headers.get("origin");
+  if ((site !== null && site !== "same-origin") || (origin !== null && origin !== url.origin)) {
+    throw new HttpError(403, "cross-origin request");
   }
 }
 
@@ -345,40 +375,36 @@ async function route(request: Request, deps: RouteDeps): Promise<Response> {
     // 其余页面维持 img-src 'self' data: 的最严策略。
     return htmlPage(homePage(), { posters: true });
   }
-  if (method === "POST" && path === "/api/alipay/notify") {
-    return alipayNotify(request, deps);
+  if (method === "POST" && path === "/api/waffo/webhook") {
+    return waffoWebhook(request, deps);
   }
-  if (method === "POST" && path === "/api/alipay/checkout") {
-    return createAlipayCheckout(request, deps);
+  if (method === "POST" && path === "/api/checkout") {
+    assertSameOriginRequest(request, url);
+    return createWaffoCheckout(request, deps);
   }
-  if (method === "GET" && path === "/alipay/checkout") {
-    return openAlipayCheckout(url, deps);
-  }
-  const alipayStatusMatch = path.match(/^\/api\/alipay\/orders\/([^/]+)\/status$/);
-  if (method === "GET" && alipayStatusMatch !== null) {
-    const rawOrderId = alipayStatusMatch[1] ?? "";
+  const waffoStatusMatch = path.match(/^\/api\/orders\/([^/]+)\/status$/);
+  if (method === "GET" && waffoStatusMatch !== null) {
+    const rawOrderId = waffoStatusMatch[1] ?? "";
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(rawOrderId)) {
       return json({ error: "not found" }, 404, { noStore: true });
     }
-    return getAlipayOrderStatus(request, deps, rawOrderId);
+    return getWaffoOrderStatus(request, deps, rawOrderId);
   }
-  const alipayCloseMatch = path.match(/^\/api\/alipay\/orders\/([^/]+)\/close$/);
-  if (method === "POST" && alipayCloseMatch !== null) {
-    const rawOrderId = alipayCloseMatch[1] ?? "";
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(rawOrderId)) {
-      return json({ error: "not found" }, 404, { noStore: true });
-    }
-    return closeAlipayOrderRoute(request, deps, rawOrderId);
-  }
-  // /buy —— 支付宝档位选择页。
+  // /buy —— Waffo 微信支付档位选择页。
   if (method === "GET" && path === "/buy") {
-    return htmlPage(buyPage({ alipayConfigured: deps.alipayApi !== undefined }), { noStore: true });
+    return htmlPage(buyPage({ waffoConfigured: deps.waffoApi !== undefined }), { noStore: true });
   }
-  // /payment-success —— 支付宝同步 return_url 的落点。页面只查本地订单状态,
+  // /payment-success —— Waffo success_url 的落点。页面只查本地订单状态,
   // return 参数本身绝不作为付款成功证据。
   // noStore:这是一次性的支付确认页,不该被缓存复用。
   if (method === "GET" && path === "/payment-success") {
     return htmlPage(paymentSuccessPage(), { noStore: true });
+  }
+  if (method === "GET" && path === "/link") {
+    return await instanceLinkLanding(url, deps);
+  }
+  if (method === "POST" && path === "/link") {
+    return await confirmInstanceLink(request, deps);
   }
   // 合规五页（条款/隐私/退款/定价/联系）。两个 host 都放行。
   if (method === "GET" && path.length > 1) {
@@ -458,8 +484,21 @@ ${hreflang}
   if (method === "POST" && path === "/api/auth/magic") {
     return await requestMagicLink(request, deps);
   }
+  if (method === "POST" && path === "/api/instance-link/start") {
+    return await startInstanceLink(request, deps);
+  }
+  if (method === "POST" && path === "/api/instance-link/poll") {
+    return await pollInstanceLink(request, deps);
+  }
+  if (method === "POST" && path === "/api/instance-link/revoke") {
+    return await revokeInstanceLink(request, deps);
+  }
   if (method === "GET" && path === "/auth/callback") {
-    return await magicCallback(url, deps);
+    return await magicLanding(url, deps);
+  }
+  if (method === "POST" && path === "/auth/callback") {
+    assertSameOriginRequest(request, url);
+    return await confirmMagicLogin(request, deps);
   }
   if (method === "GET" && path === "/login") {
     return htmlPage(loginPage(turnstileSitekeyIfConfigured(deps)));
@@ -470,10 +509,15 @@ ${hreflang}
   if (method === "GET" && path === "/api/slug/check") {
     return await slugCheckRoute(url, request, deps);
   }
+  if (method === "GET" && path === "/api/account") {
+    return await accountRoute(request, deps);
+  }
   if (method === "POST" && path === "/api/claim-code") {
+    assertSameOriginRequest(request, url);
     return await issueClaimCode(request, deps);
   }
   if (method === "POST" && path === "/api/provision") {
+    assertSameOriginRequest(request, url);
     return await selfServeProvision(request, deps);
   }
   if (method === "POST" && path === "/api/claim/exchange") {
@@ -522,17 +566,6 @@ ${hreflang}
   }
 
   // ---- admin api (bearer required) ----
-  if (path === "/api/admin/alipay/refund" && method === "POST") {
-    requireAdmin(request, deps.adminToken);
-    return adminAlipayRefund(request, deps);
-  }
-  const refundQueryMatch = path.match(/^\/api\/admin\/alipay\/refund\/([^/]+)$/);
-  if (refundQueryMatch !== null && method === "GET") {
-    requireAdmin(request, deps.adminToken);
-    const requestNo = decodeParam(refundQueryMatch[1] ?? "");
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(requestNo)) throw new HttpError(404, "not found");
-    return adminAlipayRefundQuery(requestNo, deps);
-  }
   if (path === "/api/admin/invites") {
     requireAdmin(request, deps.adminToken);
     if (method === "GET") {
@@ -593,11 +626,16 @@ ${hreflang}
     const endpointId = decodeParam(revokeMatch[1] ?? "");
     // 404 (not 500) for a missing endpoint — the admin client distinguishes
     // "already gone" from "revoke failed".
-    if ((await deps.db.getEndpointById(endpointId)) === null) {
+    const existing = await deps.db.getEndpointById(endpointId);
+    if (existing === null) {
       throw new HttpError(404, "endpoint not found");
     }
+    // Retrying a failed cleanup finishes that revoke: keep why it happened, so an address taken
+    // down for expiry or a refund stays restorable after renewal.
+    const reason = existing.status === "revoke_failed" && existing.revoke_reason !== null ? existing.revoke_reason : "admin";
     const result = await revokeEndpoint({
       endpointId,
+      reason,
       deps: { cf: deps.cf, db: deps.db, now: deps.now, newAuditId: deps.newAuditId },
     });
     return json({ hostname: result.hostname, revoked: true });
@@ -672,8 +710,7 @@ async function requestMagicLink(request: Request, deps: RouteDeps): Promise<Resp
   // rootDomain 需 normalize:CONNECT_ROOT_DOMAIN 可能带空白/大小写,直拼到邮件
   // 链接里会坏掉——与路由期待的规范 host 不符(Copilot round 3)。
   const domain = deps.rootDomain.trim().toLowerCase();
-  const origin =
-    deps.alipayEnvironment === "sandbox" ? new URL(request.url).origin : `https://${domain}`;
+  const origin = deps.waffoEnvironment === "test" ? new URL(request.url).origin : `https://${domain}`;
   const url = `${origin}/auth/callback?t=${encodeURIComponent(token)}`;
   // 发信失败不改变对外结果(固定 202):既不泄露邮箱是否存在,也不让
   // Resend 的抖动变成用户可见的 500。失败在 sender 内部已 console.error。
@@ -695,7 +732,7 @@ async function requestMagicLink(request: Request, deps: RouteDeps): Promise<Resp
  *  早先多处裸写 `Date.parse(deps.now())`:now 坏值 → NaN → session 总被判无效 →
  *  401 误导排障,以为用户没登录而真正的问题是服务器时钟。
  *  现在一处守卫,四处复用,与别处「non-finite now 视为过期」的守卫契约一致。 */
-async function parseSessionWithValidatedNow(
+export async function parseSessionWithValidatedNow(
   cookie: string | null,
   deps: Pick<RouteDeps, "sessionSecret" | "now">,
 ): Promise<{ ok: false } | { ok: true; accountId: string }> {
@@ -704,9 +741,20 @@ async function parseSessionWithValidatedNow(
   return parseSessionCookie(cookie, { secret: deps.sessionSecret, now: nowMs });
 }
 
+async function resolveRouteAccount(
+  request: Request,
+  deps: RouteDeps,
+): ReturnType<typeof resolveAccount> {
+  return resolveAccount(request, {
+    db: deps.db,
+    sessionSecret: deps.sessionSecret,
+    now: deps.now,
+  });
+}
+
 async function selfServeProvision(request: Request, deps: RouteDeps): Promise<Response> {
-  const session = await parseSessionWithValidatedNow(request.headers.get("cookie"), deps);
-  if (!session.ok) throw new HttpError(401, "unauthorized");
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) throw new HttpError(401, "unauthorized");
   const body = await readJsonBody(request);
   const slugRaw = optString(body.slug);
   if (slugRaw === null) throw new HttpError(400, "slug required");
@@ -716,9 +764,21 @@ async function selfServeProvision(request: Request, deps: RouteDeps): Promise<Re
   } catch (e) {
     throw new HttpError(400, e instanceof Error ? e.message : "invalid slug");
   }
+  const restorable = await deps.db.getRestorableEndpointByAccountId(accountAuth.accountId);
+  if (restorable !== null && restorable.slug === slug) {
+    try {
+      const result = await restoreEndpoint({
+        accountId: accountAuth.accountId,
+        deps: { cf: deps.cf, db: deps.db, now: deps.now, newAuditId: deps.newAuditId },
+      });
+      return json({ hostname: result.hostname }, 200, { noStore: true });
+    } catch (e) {
+      throw selfServeHttpError(e);
+    }
+  }
   try {
     const result = await provisionEndpoint({
-      origin: { kind: "account", accountId: session.accountId },
+      origin: { kind: "account", accountId: accountAuth.accountId },
       slug,
       deps: {
         cf: deps.cf,
@@ -734,192 +794,50 @@ async function selfServeProvision(request: Request, deps: RouteDeps): Promise<Re
     // 显式收窄一层,响应形状永远不含敏感字段。
     return json({ hostname: result.hostname }, 200, { noStore: true });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "";
-    // 无有效时长:语义上最诚实的 402(前端据此引导去 /pricing 续期/开通)。
-    if (msg.includes("no active entitlement")) {
-      throw new HttpError(402, "no active entitlement");
-    }
-    // 陈旧 session(账号已删)fail closed。
-    if (msg.includes("account not found")) {
-      throw new HttpError(401, "unauthorized");
-    }
-    // 一账号一 live endpoint:预检消息 + 部分唯一索引的 UNIQUE 兜底,两条路
-    // 归并为同一个 409 语义,body error 供前端区分于 slug 冲突。
-    if (
-      msg.includes("already provisioned") ||
-      msg.includes("UNIQUE constraint failed: endpoints.account_id")
-    ) {
-      throw new HttpError(409, "already provisioned");
-    }
-    // slug/hostname 冲突:预检消息与 UNIQUE 兜底同样归并(与 provisionInvite
-    // 的映射一致——绝不回显裸 UNIQUE 文本泄 schema)。
-    if (
-      msg.includes("already in use") ||
-      msg.includes("UNIQUE constraint failed: endpoints.slug") ||
-      msg.includes("UNIQUE constraint failed: endpoints.hostname")
-    ) {
-      throw new HttpError(409, "slug taken");
-    }
-    // 容量已满 → 503(共享 helper,见 capacity.ts:两条 provision 路由必须
-    // 用同一个判定,否则漏掉的那条会把容量满变成 500)。
-    if (isAtCapacityError(e)) {
-      throw new HttpError(503, "at capacity");
-    }
-    throw e;
+    throw selfServeHttpError(e);
   }
 }
 
-function alipayServiceDeps(deps: RouteDeps): AlipayServiceDeps | null {
-  if (deps.alipayApi === undefined) return null;
-  return {
-    db: deps.db,
-    alipayApi: deps.alipayApi,
-    alipayAppId: deps.alipayAppId?.trim() ?? "",
-    alipaySellerId: deps.alipaySellerId?.trim() ?? "",
-    now: deps.now,
-    newAccountId: deps.newAccountId,
-    newEntitlementId: deps.newEntitlementId,
-  };
-}
-
-function alipayRefundDeps(deps: RouteDeps): AlipayRefundDeps | null {
-  const service = alipayServiceDeps(deps);
-  if (service === null) return null;
-  return {
-    ...service,
-    cf: deps.cf,
-    newAuditId: deps.newAuditId,
-    newRefundRequestNo:
-      deps.newAlipayRefundRequestNo ?? (() => `RF${randomHex(16).toUpperCase()}`),
-  };
-}
-
-function alipayNotifyResponse(body: "success" | "rejected" | "retry", status: number): Response {
-  return new Response(body, {
-    status,
-    headers: {
-      "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
-    },
-  });
-}
-
-/** Async notifications are acknowledged only after durable entitlement fulfillment. */
-async function alipayNotify(request: Request, deps: RouteDeps): Promise<Response> {
-  const service = alipayServiceDeps(deps);
+/** 开通和恢复共用的错误映射。恢复多两种：nothing to restore、restore cleanup failed。 */
+function selfServeHttpError(e: unknown): never {
+  const msg = e instanceof Error ? e.message : "";
+  // 无有效时长:语义上最诚实的 402(前端据此引导去 /pricing 续期/开通)。
+  if (msg.includes("no active entitlement")) {
+    throw new HttpError(402, "no active entitlement");
+  }
+  // 陈旧 session(账号已删)fail closed。
+  if (msg.includes("account not found")) {
+    throw new HttpError(401, "unauthorized");
+  }
+  // 一账号一 live endpoint:预检消息 + 部分唯一索引的 UNIQUE 兜底,两条路
+  // 归并为同一个 409 语义,body error 供前端区分于 slug 冲突。
+  // nothing to restore 同样是「现在不能再开一个地址」。
   if (
-    service === null ||
-    service.alipayAppId === "" ||
-    service.alipaySellerId === ""
+    msg.includes("already provisioned") ||
+    msg === "nothing to restore" ||
+    msg.includes("UNIQUE constraint failed: endpoints.account_id")
   ) {
-    return alipayNotifyResponse("retry", 503);
+    throw new HttpError(409, "already provisioned");
   }
-  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
-  if (!contentType.startsWith("application/x-www-form-urlencoded")) {
-    return alipayNotifyResponse("rejected", 400);
+  // slug/hostname 冲突:预检消息与 UNIQUE 兜底同样归并(与 provisionInvite
+  // 的映射一致——绝不回显裸 UNIQUE 文本泄 schema)。
+  if (
+    msg.includes("already in use") ||
+    msg.includes("UNIQUE constraint failed: endpoints.slug") ||
+    msg.includes("UNIQUE constraint failed: endpoints.hostname")
+  ) {
+    throw new HttpError(409, "slug taken");
   }
-  const raw = await readBodyTextCapped(request, MAX_PAYMENT_NOTIFY_BODY_BYTES);
-  if (raw.trim() === "") return alipayNotifyResponse("rejected", 400);
-  try {
-    const order = await acceptAlipayNotification(new URLSearchParams(raw), service);
-    if (order.status !== "fulfilled") return alipayNotifyResponse("retry", 503);
-    return alipayNotifyResponse("success", 200);
-  } catch (error) {
-    if (error instanceof IgnoredAlipayNotificationError) {
-      // A verified merchant-owned refund/close/split event is safe to acknowledge, but it must
-      // never flow through the buyer-payment fulfillment path.
-      return alipayNotifyResponse("success", 200);
-    }
-    if (error instanceof InvalidAlipayEvidenceError) {
-      return alipayNotifyResponse("rejected", 400);
-    }
-    // Never include raw notification fields, signatures, or internal storage errors in the reply.
-    console.error("Alipay notification fulfillment failed");
-    return alipayNotifyResponse("retry", 503);
+  if (msg === "restore cleanup failed") {
+    throw new HttpError(503, "restore cleanup failed");
   }
+  // 容量已满 → 503(共享 helper,见 capacity.ts:两条 provision 路由必须
+  // 用同一个判定,否则漏掉的那条会把容量满变成 500)。
+  if (isAtCapacityError(e)) {
+    throw new HttpError(503, "at capacity");
+  }
+  throw e;
 }
-
-async function closeAlipayOrderRoute(
-  request: Request,
-  deps: RouteDeps,
-  orderId: string,
-): Promise<Response> {
-  const session = await parseSessionWithValidatedNow(request.headers.get("cookie"), deps);
-  if (!session.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
-  const order = await deps.db.getPaymentOrderById(orderId);
-  if (order === null || order.account_id !== session.accountId) {
-    return json({ error: "not found" }, 404, { noStore: true });
-  }
-  const service = alipayServiceDeps(deps);
-  if (service === null) return json({ error: "checkout not configured" }, 503, { noStore: true });
-  try {
-    const result = await closeAlipayOrder(order.id, service);
-    if (result.status === "closed") return json({ status: "closed" }, 200, { noStore: true });
-    if (result.status === "fulfilled") {
-      return json({ status: "fulfilled" }, 409, { noStore: true });
-    }
-    if (result.status === "paid") {
-      return json({ status: "paid_unfulfilled" }, 409, { noStore: true });
-    }
-    if (result.status === "refunded") return json({ status: "closed" }, 409, { noStore: true });
-    return json({ error: "close unavailable" }, 502, { noStore: true });
-  } catch {
-    return json({ error: "close unavailable" }, 502, { noStore: true });
-  }
-}
-
-function refundResponse(
-  result: Awaited<ReturnType<typeof requestFullAlipayRefund>>,
-): Response {
-  return json(
-    {
-      status: result.status,
-      order_id: result.order.id,
-      refund_request_no: result.order.refund_request_no,
-    },
-    result.status === "refunded" ? 200 : 202,
-    { noStore: true },
-  );
-}
-
-async function adminAlipayRefund(request: Request, deps: RouteDeps): Promise<Response> {
-  const body = await readJsonBody(request);
-  const orderId = optString(body.order_id);
-  if (orderId === null || !/^[A-Za-z0-9_-]{1,128}$/.test(orderId)) {
-    throw new HttpError(400, "order_id required");
-  }
-  const order = await deps.db.getPaymentOrderById(orderId);
-  if (order === null) throw new HttpError(404, "order not found");
-  if (order.status !== "paid" && order.status !== "fulfilled" && order.status !== "refunded") {
-    throw new HttpError(409, "order is not refundable");
-  }
-  const service = alipayRefundDeps(deps);
-  if (service === null) return json({ error: "checkout not configured" }, 503, { noStore: true });
-  try {
-    return refundResponse(await requestFullAlipayRefund(order.id, service));
-  } catch (error) {
-    if (error instanceof AlipayOperationError) {
-      return json({ error: "refund unavailable" }, 409, { noStore: true });
-    }
-    return json({ error: "refund unavailable" }, 502, { noStore: true });
-  }
-}
-
-async function adminAlipayRefundQuery(requestNo: string, deps: RouteDeps): Promise<Response> {
-  if ((await deps.db.getPaymentOrderByRefundRequestNo(requestNo)) === null) {
-    throw new HttpError(404, "refund not found");
-  }
-  const service = alipayRefundDeps(deps);
-  if (service === null) return json({ error: "checkout not configured" }, 503, { noStore: true });
-  try {
-    return refundResponse(await queryAlipayRefund(requestNo, service));
-  } catch (error) {
-    if (error instanceof InvalidAlipayEvidenceError) throw new HttpError(404, "refund not found");
-    return json({ error: "refund unavailable" }, 502, { noStore: true });
-  }
-}
-
-const ALIPAY_CHECKOUT_TTL_MS = 20 * 60_000;
 
 function randomHex(bytes: number): string {
   const buffer = crypto.getRandomValues(new Uint8Array(bytes));
@@ -927,47 +845,105 @@ function randomHex(bytes: number): string {
 }
 
 function newPaymentOrderId(deps: RouteDeps): string {
-  return deps.newPaymentOrderId?.() ?? `ord_${randomHex(16)}`;
+  return deps.newPaymentOrderId?.() ?? "ord_" + randomHex(16);
 }
 
-function newAlipayOutTradeNo(deps: RouteDeps): string {
-  return deps.newAlipayOutTradeNo?.() ?? `MC${randomHex(16).toUpperCase()}`;
+function newWaffoExternalId(deps: RouteDeps): string {
+  return deps.newWaffoExternalId?.() ?? "MC" + randomHex(24).toUpperCase();
 }
 
 function newCheckoutToken(deps: RouteDeps): string {
-  return deps.newCheckoutToken?.() ?? `chk_${randomHex(24)}`;
+  return deps.newCheckoutToken?.() ?? "chk_" + randomHex(24);
 }
 
-/** Create an account-bound order from a server-owned tier and amount. */
-async function createAlipayCheckout(request: Request, deps: RouteDeps): Promise<Response> {
-  const session = await parseSessionWithValidatedNow(request.headers.get("cookie"), deps);
-  if (!session.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
-  const account = await deps.db.getAccountById(session.accountId);
-  if (account === null) return json({ error: "unauthorized" }, 401, { noStore: true });
-  if (deps.alipayApi === undefined) {
-    return json({ error: "checkout not configured" }, 503, { noStore: true });
+function isProductionHost(request: Request, rootDomain: string): boolean {
+  const hostname = new URL(request.url).hostname.toLowerCase();
+  const root = rootDomain.trim().toLowerCase();
+  return root !== "" && (hostname === root || hostname.endsWith("." + root));
+}
+
+function assertWaffoRuntime(request: Request, deps: RouteDeps): WaffoApi {
+  if (deps.waffoApi === undefined || deps.waffoEnvironment === undefined || deps.waffoStoreId?.trim() === "") {
+    throw new HttpError(503, "checkout_not_open");
   }
+  if (deps.waffoEnvironment !== "prod" && deps.waffoEnvironment !== "test") {
+    throw new HttpError(503, "checkout_not_open");
+  }
+  if (deps.waffoEnvironment === "test" && isProductionHost(request, deps.rootDomain)) {
+    throw new HttpError(503, "checkout_not_open");
+  }
+  return deps.waffoApi;
+}
+
+function waffoProductId(deps: RouteDeps, tier: ReturnType<typeof resolvePaymentTier>): string | null {
+  if (tier === null || deps.waffoProducts === undefined) return null;
+  return deps.waffoProducts[tier.id];
+}
+
+function paymentOrigin(request: Request, deps: RouteDeps): string {
+  return deps.waffoEnvironment === "prod"
+    ? "https://" + deps.rootDomain.trim().toLowerCase()
+    : new URL(request.url).origin;
+}
+
+// A buyer needs a handful of attempts a day; 20 keeps one account far below the 200-row reconciliation batch.
+const WAFFO_CHECKOUT_DAILY_LIMIT = 20;
+
+/** Create an account-bound Waffo order from a server-owned tier and amount. */
+async function createWaffoCheckout(request: Request, deps: RouteDeps): Promise<Response> {
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
+  const api = assertWaffoRuntime(request, deps);
+  const account = await deps.db.getAccountById(accountAuth.accountId);
+  if (account === null) return json({ error: "unauthorized" }, 401, { noStore: true });
 
   const body = await readJsonBody(request);
-  const tier = resolveAlipayTier(body.tier);
+  const tier = resolvePaymentTier(body.tier);
   if (tier === null) throw new HttpError(400, "unknown tier");
+  const productId = waffoProductId(deps, tier);
+  if (productId === null || productId.trim() === "") {
+    return json({ error: "checkout_not_open" }, 503, { noStore: true });
+  }
+
+  let requestedSuccessUrl: string | null = null;
+  if (accountAuth.via === "bearer" && body.returnUrl !== undefined) {
+    if (typeof body.returnUrl !== "string" || body.returnUrl.length > 400) {
+      throw new HttpError(400, "invalid returnUrl");
+    }
+    try {
+      const candidate = new URL(body.returnUrl);
+      if (
+        (candidate.protocol !== "http:" && candidate.protocol !== "https:") ||
+        candidate.username !== "" ||
+        candidate.password !== ""
+      ) {
+        throw new Error("invalid returnUrl");
+      }
+      requestedSuccessUrl = candidate.toString();
+    } catch {
+      throw new HttpError(400, "invalid returnUrl");
+    }
+  }
 
   const now = deps.now();
   const nowMs = Date.parse(now);
   if (!Number.isFinite(nowMs)) throw new HttpError(500, "server time unavailable");
-  const checkoutToken = newCheckoutToken(deps);
-  const order = await deps.db.insertPaymentOrder({
+  const sinceIso = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
+  const externalId = newWaffoExternalId(deps);
+  const order = {
     id: newPaymentOrderId(deps),
-    checkout_token_sha256: await sha256Hex(checkoutToken),
+    checkout_token_sha256: await sha256Hex(externalId),
     account_id: account.id,
-    provider: "alipay",
-    out_trade_no: newAlipayOutTradeNo(deps),
+    provider: "waffo",
+    out_trade_no: externalId,
     trade_no: null,
+    waffo_session_id: null,
+    waffo_order_id: null,
     months: tier.months,
     total_amount: tier.totalAmount,
     status: "created",
     created_at: now,
-    expires_at: new Date(nowMs + ALIPAY_CHECKOUT_TTL_MS).toISOString(),
+    expires_at: new Date(nowMs + 1_800_000).toISOString(),
     paid_at: null,
     fulfilled_at: null,
     closed_at: null,
@@ -975,72 +951,35 @@ async function createAlipayCheckout(request: Request, deps: RouteDeps): Promise<
     refund_request_no: null,
     last_notify_id: null,
     last_queried_at: null,
-  });
-  return json(
-    {
-      order_id: order.id,
-      checkout_url: `/alipay/checkout?checkout=${encodeURIComponent(checkoutToken)}`,
-    },
-    200,
-    { noStore: true },
-  );
-}
-
-/** Resolve the bearer checkout capability and emit a signed Alipay page-pay form. */
-async function openAlipayCheckout(url: URL, deps: RouteDeps): Promise<Response> {
-  const checkoutToken = url.searchParams.get("checkout") ?? "";
-  if (checkoutToken === "" || checkoutToken.length > 256) {
-    return json({ error: "not found" }, 404, { noStore: true });
+  } satisfies PaymentOrderRow;
+  if (!(await deps.db.insertPaymentOrderWithinDailyLimit(order, { sinceIso, limit: WAFFO_CHECKOUT_DAILY_LIMIT }))) {
+    return json({ error: "too_many_checkouts" }, 429, { noStore: true });
   }
-  const order = await deps.db.getPaymentOrderByCheckoutHash(await sha256Hex(checkoutToken));
-  if (order === null) return json({ error: "not found" }, 404, { noStore: true });
-
-  const nowMs = Date.parse(deps.now());
-  const expiresMs = Date.parse(order.expires_at);
-  if (!Number.isFinite(nowMs) || !Number.isFinite(expiresMs)) {
-    return json({ error: "unavailable" }, 500, { noStore: true });
-  }
-  if (nowMs >= expiresMs) return json({ error: "checkout expired" }, 410, { noStore: true });
-  if (
-    order.status !== "created" &&
-    order.status !== "form_issued" &&
-    order.status !== "pending"
-  ) {
-    return json({ error: "order is not payable" }, 409, { noStore: true });
-  }
-  const api = deps.alipayApi;
-  if (api === undefined) return json({ error: "checkout not configured" }, 503, { noStore: true });
-
-  const tier = Object.values(ALIPAY_TIERS).find((candidate) => candidate.months === order.months);
-  if (tier === undefined || tier.totalAmount !== order.total_amount) {
-    return json({ error: "order unavailable" }, 500, { noStore: true });
-  }
-  const root = deps.rootDomain.trim().toLowerCase();
-  const sandbox = deps.alipayEnvironment === "sandbox";
-  const origin = sandbox ? url.origin : `https://${root}`;
   try {
-    const form = await api.pagePayForm({
-      outTradeNo: order.out_trade_no,
-      totalAmount: order.total_amount,
-      subject: `Mediary Connect ${tier.label}`,
-      // A localhost callback is not reachable by Alipay. Omit notify_url in sandbox-local mode
-      // and use the owned status page's signed trade.query compensation instead.
-      ...(sandbox ? {} : { notifyUrl: `${origin}/api/alipay/notify` }),
-      returnUrl: `${origin}/payment-success?order=${encodeURIComponent(order.id)}`,
+    const sessionResult = await api.createSession({
+      productId,
+      productType: "onetime",
+      currency: "CNY",
+      successUrl:
+        requestedSuccessUrl ??
+        paymentOrigin(request, deps) + "/payment-success?order=" + encodeURIComponent(order.id),
+      orderMerchantExternalId: order.out_trade_no,
+      metadata: { orderId: order.id },
+      expiresInSeconds: 1800,
+      language: "zh-Hans",
+      buyerEmail: account.email,
     });
-    if (order.status === "created") {
-      await deps.db.compareAndSetPaymentOrder(
-        order.id,
-        { statuses: ["created"] },
-        { status: "form_issued" },
-      );
+    await deps.db.updatePaymentOrder(order.id, {
+      waffo_session_id: sessionResult.sessionId,
+      expires_at: sessionResult.expiresAt,
+    });
+    return json({ checkoutUrl: sessionResult.checkoutUrl, orderId: order.id }, 200, { noStore: true });
+  } catch (error) {
+    if (isWaffoNotApprovedError(error)) {
+      return json({ error: "checkout_not_open" }, 503, { noStore: true });
     }
-    return htmlPage(form, {
-      noStore: true,
-      alipayForm: deps.alipayEnvironment === "sandbox" ? "sandbox" : true,
-    });
-  } catch {
-    return json({ error: "checkout unavailable" }, 502, { noStore: true });
+    console.error("Waffo checkout session failed");
+    return json({ error: "checkout_unavailable" }, 503, { noStore: true });
   }
 }
 
@@ -1055,33 +994,277 @@ function browserPaymentStatus(order: PaymentOrderRow, nowMs: number): BrowserPay
   return "pending";
 }
 
-/** Task 4 exposes local state only; Task 5 adds signed trade-query compensation here. */
-async function getAlipayOrderStatus(
-  request: Request,
+async function fulfillWaffoOrder(staleOrder: PaymentOrderRow, deps: RouteDeps): Promise<PaymentOrderRow> {
+  const order = await deps.db.getPaymentOrderById(staleOrder.id);
+  if (order === null) throw new Error("payment order disappeared");
+  if (order.status === "fulfilled" || order.status === "refunded") return order;
+  if (order.status !== "paid") throw new Error("Waffo order has no verified paid state");
+  const account = await deps.db.getAccountById(order.account_id);
+  if (account === null) throw new Error("payment account missing");
+  await grantEntitlement({
+    accountId: account.id,
+    email: account.email,
+    months: order.months,
+    source: "waffo",
+    paymentProvider: "waffo",
+    paymentTransactionId: order.out_trade_no,
+  }, deps);
+  const committed = await deps.db.compareAndSetPaymentOrder(
+    order.id,
+    { statuses: ["paid"], refundRequestNo: null },
+    { status: "fulfilled", fulfilled_at: deps.now() },
+  );
+  const latest = await deps.db.getPaymentOrderById(order.id);
+  if (latest === null) throw new Error("fulfilled payment order disappeared");
+  if (committed || latest.status === "fulfilled") return latest;
+  if (latest.status === "refunded") {
+    await deps.db.markEntitlementRefunded("waffo", order.out_trade_no, deps.now());
+    await reconcileEntitlementLedger(order.account_id, deps.db);
+  }
+  return (await deps.db.getPaymentOrderById(order.id)) ?? latest;
+}
+
+async function acceptWaffoPayment(
+  evidence: { orderId: string; paymentId: string; orderMerchantExternalId: string; currency: string; total: string; paymentStatus: string },
   deps: RouteDeps,
+): Promise<PaymentOrderRow> {
+  const order = await deps.db.getPaymentOrderByOutTradeNo(evidence.orderMerchantExternalId);
+  if (order === null || order.provider !== "waffo") throw new InvalidWaffoEvidenceError("Waffo payment order not found");
+  assertWaffoCompletedEvidence(evidence, order.out_trade_no, order.total_amount);
+  if (order.trade_no !== null && order.trade_no !== evidence.paymentId) {
+    throw new InvalidWaffoEvidenceError("Waffo payment id mismatch");
+  }
+  if (order.status === "closed" || order.status === "refunded") {
+    throw new InvalidWaffoEvidenceError("Waffo order is terminal and not payable");
+  }
+  if (order.status !== "fulfilled" && order.status !== "paid") {
+    const changed = await deps.db.compareAndSetPaymentOrder(
+      order.id,
+      { statuses: ["created", "form_issued", "pending"] },
+      { status: "paid", trade_no: evidence.paymentId, waffo_order_id: evidence.orderId, paid_at: deps.now() },
+    );
+    if (!changed) {
+      const latest = await deps.db.getPaymentOrderById(order.id);
+      if (latest === null) throw new Error("payment order disappeared");
+      if (latest.trade_no !== null && latest.trade_no !== evidence.paymentId) {
+        throw new InvalidWaffoEvidenceError("Waffo payment id mismatch");
+      }
+      if (latest.status === "fulfilled") return latest;
+      if (latest.status !== "paid") throw new InvalidWaffoEvidenceError("Waffo paid state race");
+    }
+  } else if (order.status === "paid" && (order.trade_no === null || order.waffo_order_id === null)) {
+    await deps.db.updatePaymentOrder(order.id, {
+      ...(order.trade_no === null ? { trade_no: evidence.paymentId } : {}),
+      ...(order.waffo_order_id === null ? { waffo_order_id: evidence.orderId } : {}),
+    });
+  }
+  return fulfillWaffoOrder((await deps.db.getPaymentOrderById(order.id)) ?? order, deps);
+}
+
+async function applyWaffoRefund(order: PaymentOrderRow, deps: RouteDeps): Promise<PaymentOrderRow> {
+  let current = (await deps.db.getPaymentOrderById(order.id)) ?? order;
+  if (current.status === "created" || current.status === "form_issued" || current.status === "pending") {
+    console.warn("Waffo refund received for an unpaid local order");
+    return current;
+  }
+  if (current.status !== "refunded") {
+    if (!canTransitionPaymentOrder(current.status, "refunded")) {
+      throw new InvalidWaffoEvidenceError("Waffo order cannot be refunded");
+    }
+    await deps.db.compareAndSetPaymentOrder(
+      current.id,
+      { statuses: ["paid", "fulfilled"] },
+      { status: "refunded", refunded_at: deps.now() },
+    );
+    current = (await deps.db.getPaymentOrderById(current.id)) ?? current;
+  }
+  await deps.db.markEntitlementRefunded("waffo", current.out_trade_no, deps.now());
+  const expiry = await reconcileEntitlementLedger(current.account_id, deps.db);
+  if (!isEntitlementActive(expiry, deps.now())) {
+    const endpoint = (await deps.db.listEndpoints()).find(
+      (candidate) => candidate.account_id === current.account_id && candidate.status !== "revoked",
+    );
+    if (endpoint !== undefined) {
+      await revokeEndpoint({
+        endpointId: endpoint.id,
+        reason: "refunded",
+        deps: { cf: deps.cf, db: deps.db, now: deps.now, newAuditId: deps.newAuditId, actor: "system" },
+      });
+    }
+  }
+  return (await deps.db.getPaymentOrderById(current.id)) ?? current;
+}
+
+function paymentEvidenceFromQuery(order: PaymentOrderRow, payment: WaffoPayment) {
+  const currency = payment.amount?.currency ?? "";
+  const total = normalizeWaffoAmount(payment.amount);
+  if (total === null) throw new InvalidWaffoEvidenceError("Waffo payment amount is missing");
+  if (typeof payment.orderMerchantExternalId !== "string" || payment.orderMerchantExternalId.trim() === "") {
+    throw new InvalidWaffoEvidenceError("Waffo order merchant external id is missing");
+  }
+  return {
+    orderId: payment.orderId,
+    paymentId: payment.id,
+    orderMerchantExternalId: payment.orderMerchantExternalId.trim(),
+    currency,
+    total,
+    paymentStatus: payment.status,
+  };
+}
+
+interface WaffoCompensationOptions {
+  checkFulfilledForRefund?: boolean;
+}
+
+// Covers the Waffo session/retry lifetime for unpaid orders.
+const WAFFO_UNPAID_RECONCILIATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// Covers the 14-day refund policy plus exceptional refunds granted later by the owner.
+const WAFFO_SETTLED_RECONCILIATION_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
+// Keeps one daily run inside the cron wall-clock limit; later runs cover the rest.
+const WAFFO_RECONCILIATION_BATCH_LIMIT = 200;
+
+async function compensateWaffoOrder(
   orderId: string,
-): Promise<Response> {
-  const session = await parseSessionWithValidatedNow(request.headers.get("cookie"), deps);
-  if (!session.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
+  deps: RouteDeps,
+  options: WaffoCompensationOptions = {},
+): Promise<PaymentOrderRow> {
   let order = await deps.db.getPaymentOrderById(orderId);
-  if (order === null || order.account_id !== session.accountId) {
+  if (order === null) throw new InvalidWaffoEvidenceError("Waffo payment order not found");
+  if (order.provider !== "waffo") throw new InvalidWaffoEvidenceError("payment provider mismatch");
+  if (order.status === "refunded") return order;
+  if (order.status === "fulfilled" && options.checkFulfilledForRefund !== true) return order;
+  if (order.status === "paid") return fulfillWaffoOrder(order, deps);
+  const queriedAtMs = Date.parse(deps.now());
+  if (!Number.isFinite(queriedAtMs)) throw new Error("server time is invalid");
+  const queriedAt = new Date(queriedAtMs).toISOString();
+  const cutoff = new Date(queriedAtMs - 2_500).toISOString();
+  if (!(await deps.db.claimPaymentOrderQuery(order.id, queriedAt, cutoff))) {
+    return (await deps.db.getPaymentOrderById(order.id)) ?? order;
+  }
+  const payments = await deps.waffoApi!.queryPayments(order.out_trade_no);
+  const expectedTestMode = deps.waffoEnvironment === "test";
+  const matchingPayments = payments.filter((candidate) =>
+    candidate.orderMerchantExternalId === order.out_trade_no &&
+    candidate.testMode === expectedTestMode,
+  );
+  if (matchingPayments.length === 0) return order;
+  const refundedPayment = matchingPayments.find((candidate) =>
+    candidate.isFullyRefunded === true || isWaffoFullRefund(order.total_amount, candidate),
+  );
+  if (refundedPayment !== undefined) {
+    return applyWaffoRefund(order, deps);
+  }
+  const payment = matchingPayments.find((candidate) => candidate.status === "succeeded");
+  if (payment !== undefined) {
+    return acceptWaffoPayment(paymentEvidenceFromQuery(order, payment), deps);
+  }
+  return order;
+}
+
+function waffoResponse(status: number, body: unknown): Response {
+  return json(body, status, { noStore: true });
+}
+
+async function waffoWebhook(request: Request, deps: RouteDeps): Promise<Response> {
+  const api = assertWaffoRuntime(request, deps);
+  const signature = request.headers.get("x-waffo-signature")?.trim() ?? "";
+  if (signature === "") return waffoResponse(401, { error: "invalid signature" });
+  const raw = await readBodyTextCapped(request, MAX_PAYMENT_NOTIFY_BODY_BYTES);
+  let event: Awaited<ReturnType<WaffoApi["verifyWebhook"]>>;
+  try {
+    event = await api.verifyWebhook(raw, signature);
+  } catch {
+    return waffoResponse(401, { error: "invalid signature" });
+  }
+  try {
+    if (event.mode !== deps.waffoEnvironment || event.storeId !== deps.waffoStoreId) {
+      return waffoResponse(400, { error: "webhook context mismatch" });
+    }
+    if (event.eventType === "order.completed") {
+      const eventData = event.data !== null && typeof event.data === "object"
+        ? event.data as Record<string, unknown>
+        : {};
+      const externalId = typeof eventData.orderMerchantExternalId === "string"
+        ? eventData.orderMerchantExternalId.trim()
+        : "";
+      if (externalId === "") return waffoResponse(200, { ok: true });
+      const evidence = readWaffoCompletedEvidence(event.data);
+      const order = await deps.db.getPaymentOrderByOutTradeNo(evidence.orderMerchantExternalId);
+      if (order === null || order.provider !== "waffo") return waffoResponse(200, { ok: true });
+      await acceptWaffoPayment(evidence, deps);
+      return waffoResponse(200, { ok: true });
+    }
+    if (event.eventType === "refund.succeeded") {
+      const data = event.data as Record<string, unknown>;
+      const externalId = typeof data.orderMerchantExternalId === "string" ? data.orderMerchantExternalId : "";
+      if (externalId === "") return waffoResponse(200, { ok: true });
+      const order = await deps.db.getPaymentOrderByOutTradeNo(externalId);
+      if (order === null || order.provider !== "waffo") return waffoResponse(200, { ok: true });
+      if (!isWaffoFullRefund(order.total_amount, data)) {
+        console.warn("Waffo partial refund ignored for entitlement");
+        return waffoResponse(200, { ok: true });
+      }
+      await applyWaffoRefund(order, deps);
+      return waffoResponse(200, { ok: true });
+    }
+    return waffoResponse(200, { ok: true });
+  } catch (error) {
+    if (error instanceof InvalidWaffoEvidenceError) {
+      return waffoResponse(400, { error: "invalid payment evidence" });
+    }
+    if (error instanceof Error && /signature/i.test(error.message)) {
+      return waffoResponse(401, { error: "invalid signature" });
+    }
+    console.error("Waffo webhook processing failed");
+    return waffoResponse(500, { error: "temporary failure" });
+  }
+}
+
+async function getWaffoOrderStatus(request: Request, deps: RouteDeps, orderId: string): Promise<Response> {
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
+  assertWaffoRuntime(request, deps);
+  let order = await deps.db.getPaymentOrderById(orderId);
+  if (order === null || order.account_id !== accountAuth.accountId) {
     return json({ error: "not found" }, 404, { noStore: true });
   }
   const nowMs = Date.parse(deps.now());
   if (!Number.isFinite(nowMs)) return json({ error: "unavailable" }, 500, { noStore: true });
   if (order.status !== "fulfilled" && order.status !== "closed" && order.status !== "refunded") {
-    const service = alipayServiceDeps(deps);
-    if (service === null) {
-      return json({ error: "checkout not configured" }, 503, { noStore: true });
-    }
     try {
-      order = await compensateAlipayOrder(order.id, service);
+      order = await compensateWaffoOrder(order.id, deps);
     } catch {
       return json({ error: "temporarily unavailable" }, 503, { noStore: true });
     }
   }
   return json({ status: browserPaymentStatus(order, nowMs) }, 200, { noStore: true });
 }
+
+/** Daily production reconciliation; each order is isolated so one provider/D1 failure does not stop the rest. */
+export async function reconcileWaffoOrders(
+  deps: RouteDeps,
+  options: { limit?: number } = {},
+): Promise<void> {
+  if (deps.waffoEnvironment !== "prod" || deps.waffoApi === undefined) return;
+  const nowMs = Date.parse(deps.now());
+  if (!Number.isFinite(nowMs)) throw new Error("server time is invalid");
+  const unpaidSinceIso = new Date(nowMs - WAFFO_UNPAID_RECONCILIATION_WINDOW_MS).toISOString();
+  const settledSinceIso = new Date(nowMs - WAFFO_SETTLED_RECONCILIATION_WINDOW_MS).toISOString();
+  const orders = await deps.db.listPaymentOrdersForReconciliation("waffo", {
+    unpaidSinceIso,
+    settledSinceIso,
+    limit: options.limit ?? WAFFO_RECONCILIATION_BATCH_LIMIT,
+  });
+  for (const order of orders) {
+    try {
+      await compensateWaffoOrder(order.id, deps, { checkFulfilledForRefund: true });
+    } catch (error) {
+      console.error("Waffo reconciliation failed for order", order.id, error instanceof Error ? error.message : "unknown error");
+    }
+  }
+}
+
+
 
 async function issueClaimCode(request: Request, deps: RouteDeps): Promise<Response> {
   // now 只取一次:签名过期与返回的 expires_at 必须基于同一时刻,否则两次
@@ -1091,12 +1274,9 @@ async function issueClaimCode(request: Request, deps: RouteDeps): Promise<Respon
   // new Date(NaN).toISOString() 会抛 RangeError 变裸 500;且签出的 token
   // 过期语义不可信。与别处「non-finite now 视为过期」的守卫一致,显式拒。
   if (!Number.isFinite(nowMs)) throw new HttpError(500, "server time unavailable");
-  const session = await parseSessionCookie(request.headers.get("cookie"), {
-    secret: deps.sessionSecret,
-    now: nowMs,
-  });
-  if (!session.ok) throw new HttpError(401, "unauthorized");
-  const endpoint = await deps.db.getActiveEndpointByAccountId(session.accountId);
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) throw new HttpError(401, "unauthorized");
+  const endpoint = await deps.db.getActiveEndpointByAccountId(accountAuth.accountId);
   if (endpoint === null) {
     // 还没开通(付费但未 provision,或从未开通)→ 没有可接入的实例。
     throw new HttpError(404, "no active endpoint");
@@ -1137,27 +1317,76 @@ async function exchangeClaimCode(request: Request, deps: RouteDeps): Promise<Res
 
 /** slug 实时查重 + 相似推荐(登录后选 slug 用)。需 session。 */
 async function slugCheckRoute(url: URL, request: Request, deps: RouteDeps): Promise<Response> {
-  const session = await parseSessionWithValidatedNow(request.headers.get("cookie"), deps);
-  if (!session.ok) throw new HttpError(401, "unauthorized");
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) throw new HttpError(401, "unauthorized");
   // 限流:此端点登录即可访问,且每个查询可能触发上百次 D1 查重。
   // 不限流的话任一登录用户能无限枚举全站 slug 占用情况(隐私 + 资源放大)。
   // 按账号限 —— 比按 IP 准(用户可能在 NAT 后),且它本就是登录态端点。
-  if (!slugCheckLimiter.allow(session.accountId)) {
+  if (!slugCheckLimiter.allow(accountAuth.accountId)) {
     return json({ error: "too many requests" }, 429, { noStore: true });
   }
   const slug = url.searchParams.get("s") ?? "";
   // 占用判定查所有状态的行(含 revoked/purged):slug 永久保留不释放(决策 #9)。
   // rootDomain normalize:与本文件别处一致(CONNECT_ROOT_DOMAIN 可能带空白/大小写)。
   const domain = deps.rootDomain.trim().toLowerCase();
+  // 账号自己可恢复的旧名字不算占用:旧版实例向导不认识 restorable,只会提交查重说可用的名字,
+  // 这里说「已占用」,它的主人就只能另起名字,原地址从此恢复不了。提交这个名字走的就是恢复。
+  const ownRestorable = await deps.db.getRestorableEndpointByAccountId(accountAuth.accountId);
   const isTaken: IsTaken = async (s) =>
-    (await deps.db.findEndpointBySlugOrHostname(s, `${s}.${domain}`)) !== null;
+    s !== ownRestorable?.slug && (await deps.db.findEndpointBySlugOrHostname(s, `${s}.${domain}`)) !== null;
   const result = await checkSlug(slug, isTaken);
   return json(result, 200, { noStore: true });
 }
 
+/** Account snapshot consumed by the in-instance settings wizard. */
+async function accountRoute(request: Request, deps: RouteDeps): Promise<Response> {
+  const accountAuth = await resolveRouteAccount(request, deps);
+  if (!accountAuth.ok) return json({ error: "unauthorized" }, 401, { noStore: true });
+  const account = await deps.db.getAccountById(accountAuth.accountId);
+  if (account === null) return json({ error: "unauthorized" }, 401, { noStore: true });
+
+  const now = deps.now();
+  const entitlements = await deps.db.listEntitlements(account.id);
+  const expiresAt = latestExpiry(entitlements);
+  const endpoint = await deps.db.getActiveEndpointByAccountId(account.id);
+  const restorable = endpoint === null ? await deps.db.getRestorableEndpointByAccountId(account.id) : null;
+  // Only tiers whose Waffo product is configured: /api/checkout refuses the others.
+  const tiers = Object.values(PAYMENT_TIERS).filter((tier) => (waffoProductId(deps, tier) ?? "").trim() !== "");
+  let checkoutOpen = false;
+  try {
+    assertWaffoRuntime(request, deps);
+    checkoutOpen = tiers.length > 0;
+  } catch {
+    // The account endpoint is still useful when checkout is not configured;
+    // report the gate as a boolean instead of surfacing a 503.
+  }
+
+  return json(
+    {
+      email: account.email,
+      active: isEntitlementActive(expiresAt, now),
+      expiresAt,
+      endpoint: endpoint === null
+        ? null
+        : { slug: endpoint.slug, hostname: endpoint.hostname, status: endpoint.status, tunnelId: endpoint.cf_tunnel_id },
+      restorable: restorable === null ? null : { slug: restorable.slug, hostname: restorable.hostname },
+      checkoutOpen,
+      tiers: tiers.map((tier) => ({
+        id: tier.id,
+        label: tier.label,
+        months: tier.months,
+        price: tier.totalAmount,
+        featured: tier.featured,
+      })),
+    },
+    200,
+    { noStore: true },
+  );
+}
+
 /** 按 email upsert 账号,race-safe:两个并发请求可能都读到 null,第二个
  *  INSERT 撞 UNIQUE(email) —— 捕获后重读,而不是让登录 500(Copilot round 2)。 */
-async function upsertAccount(email: string, deps: RouteDeps): Promise<AccountRow> {
+export async function upsertAccount(email: string, deps: RouteDeps): Promise<AccountRow> {
   const existing = await deps.db.getAccountByEmail(email);
   if (existing !== null) return existing;
   try {
@@ -1177,15 +1406,29 @@ async function upsertAccount(email: string, deps: RouteDeps): Promise<AccountRow
   }
 }
 
-async function magicCallback(url: URL, deps: RouteDeps): Promise<Response> {
-  const token = url.searchParams.get("t") ?? "";
+async function verifyMagicToken(token: string, deps: RouteDeps): Promise<string> {
   const result = await verifyToken(token, {
     key: deps.sessionSecret,
     now: Date.parse(deps.now()),
     expectPurpose: "magic",
   });
   if (!result.ok) throw new HttpError(400, "invalid or expired link");
-  const email = result.subject;
+  return result.subject;
+}
+
+/** 魔法链接落地:只显示确认页,不登录。任何网页都能把访客导到这里(带上它
+ *  自己的 token),GET 直接种 cookie 就是把访客登进别人的账号。 */
+async function magicLanding(url: URL, deps: RouteDeps): Promise<Response> {
+  const email = await verifyMagicToken(url.searchParams.get("t") ?? "", deps);
+  // htmlPage 自带 referrer-policy: no-referrer —— 地址栏里有 ?t=<magic token>,
+  // 不能经 Referer 带到别处。
+  return htmlPage(confirmLoginPage(email), { noStore: true });
+}
+
+/** 确认页按钮(本站页面)提交:这一步才建号/登录、种 session cookie。 */
+async function confirmMagicLogin(request: Request, deps: RouteDeps): Promise<Response> {
+  const body = await readJsonBody(request);
+  const email = await verifyMagicToken(optString(body.t) ?? "", deps);
 
   // 账号 upsert:首次登录建号,之后复用。
   const account = await upsertAccount(email, deps);
@@ -1196,17 +1439,9 @@ async function magicCallback(url: URL, deps: RouteDeps): Promise<Response> {
     ttlMs: SESSION_TTL_MS,
     now: Date.parse(deps.now()),
   });
-  return new Response(null, {
-    status: 302,
-    headers: {
-      location: "/console",
-      "set-cookie": cookie,
-      "cache-control": "no-store",
-      // URL query 里带着 ?t=<magic token>;不加 no-referrer,浏览器会把含
-      // token 的完整 referer 带到 /console 请求,进访问日志=泄露短期凭据。
-      "referrer-policy": "no-referrer",
-    },
-  });
+  const response = json({ ok: true }, 200, { noStore: true });
+  response.headers.set("set-cookie", cookie);
+  return response;
 }
 
 async function consoleRoute(request: Request, deps: RouteDeps): Promise<Response> {
@@ -1223,6 +1458,7 @@ async function consoleRoute(request: Request, deps: RouteDeps): Promise<Response
   // 该账号的 active endpoint(可能为 null:已付费但还没选 slug,或未开通)。
   // 控制台据此决定显示「选专属地址」入口还是「接入命令」提示词区。
   const endpoint = await deps.db.getActiveEndpointByAccountId(account.id);
+  const restorable = endpoint === null ? await deps.db.getRestorableEndpointByAccountId(account.id) : null;
   // 仅在「真的能走到 slug 表单」时才数配额,两个条件都要满足:
   //   1. 还没开通(已开通用户不受配额影响)
   //   2. 有有效时长(无时长的用户在 console-page 走早返回分支,压根用不到这个值)
@@ -1232,8 +1468,11 @@ async function consoleRoute(request: Request, deps: RouteDeps): Promise<Response
   const now = deps.now();
   const eligibleToProvision =
     endpoint === null && isEntitlementActive(latestExpiry(entitlements), now);
+  // 账号自己那条清理失败的旧地址被 countLiveEndpoints 偏保守计入；恢复会先删它的旧资源再数配额，
+  // 这里也不算它，否则正好满额时会把能成功的恢复藏成「售罄」。
+  const ownRevokeFailed = restorable?.status === "revoke_failed" ? 1 : 0;
   const atCapacity = eligibleToProvision
-    ? (await deps.db.countLiveEndpoints()) >= CAPACITY_LIMIT
+    ? (await deps.db.countLiveEndpoints()) - ownRevokeFailed >= CAPACITY_LIMIT
     : false;
   const url = new URL(request.url);
   return htmlPage(
@@ -1241,14 +1480,15 @@ async function consoleRoute(request: Request, deps: RouteDeps): Promise<Response
       account,
       entitlements,
       endpoint,
+      restorable: restorable === null ? null : { slug: restorable.slug, hostname: restorable.hostname },
       baseUrl: url.origin,
       rootDomain: deps.rootDomain.trim().toLowerCase(),
       now,
       atCapacity,
-      // 支付宝四项配置全部存在才给真按钮；缺项时页面明确显示不可用。
-      tiers: deps.alipayApi === undefined
+      // Waffo 配置完整才给真按钮；缺项时页面明确显示不可用。
+      tiers: deps.waffoApi === undefined || deps.waffoProducts === undefined
         ? []
-        : Object.values(ALIPAY_TIERS).map((tier) => ({
+        : Object.values(PAYMENT_TIERS).map((tier) => ({
             tierId: tier.id,
             months: tier.months,
             label: tier.label,

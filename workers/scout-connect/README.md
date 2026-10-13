@@ -1,7 +1,7 @@
 # Mediary Connect — remote access control plane
 
 Paid remote access for self-hosted Mediary Scout instances. The control plane
-accepts one-time Alipay payments, grants prepaid access time, and provisions a Cloudflare Tunnel + public hostname
+accepts one-time WeChat Pay payments through Waffo.com Limited (the merchant of record), grants prepaid access time, and provisions a Cloudflare Tunnel + public hostname
 (`<slug>.mediaryconnect.app`), and hands the home side a one-time
 `TUNNEL_TOKEN`. The entry gate is the app's own access password, set in the
 browser on first open (remote requests require login afterwards; LAN stays
@@ -18,14 +18,10 @@ admin ──► mediaryconnect.app (this worker)
             ├─ GET  /beta        beta signup page (two-step: email → optional
             │                    survey; also served on beta.mediaryconnect.app)
             ├─ GET  /admin       admin page (bearer token in sessionStorage)
-            ├─ GET  /buy         Alipay-only tier selector (¥45 / ¥108 / ¥188)
-            ├─ POST /api/alipay/checkout                    create owned order
-            ├─ GET  /alipay/checkout                        one-time signed-form hop
-            ├─ POST /api/alipay/notify                      signed async result
-            ├─ GET  /api/alipay/orders/:id/status           query compensation
-            ├─ POST /api/alipay/orders/:id/close            close unpaid order
-            ├─ POST /api/admin/alipay/refund                full refund
-            ├─ GET  /api/admin/alipay/refund/:requestNo     refund query
+            ├─ GET  /buy         WeChat Pay tier selector (¥45 / ¥108 / ¥188)
+            ├─ POST /api/checkout                            create owned order + Waffo session
+            ├─ POST /api/waffo/webhook                       signed async result
+            ├─ GET  /api/orders/:id/status                   query compensation
             ├─ GET  /api/admin/invites                     list invites
             ├─ POST /api/admin/invites                     create invite
             ├─ POST /api/admin/invites/:id/provision       tunnel+ingress+dns
@@ -45,6 +41,66 @@ admin ──► mediaryconnect.app (this worker)
                  ▼ invitee home
             docker compose --profile tunnel up -d   (TUNNEL_TOKEN in .env)
 ```
+
+### Authenticated endpoints (session cookie or instance credential)
+
+Account endpoints accept either the `__Host-mc_session` cookie or
+`Authorization: Bearer ic_...`. A present `Authorization` header is always
+checked as a bearer credential; an invalid or revoked credential does not fall
+back to a cookie.
+
+`POST /api/checkout` — body `{ tier }` (`quarter` / `year` / `two_years`).
+
+| Status | Body |
+| --- | --- |
+| 200 | `{ checkoutUrl, orderId }` — open `checkoutUrl` (Waffo, HTTPS only) in the same tab |
+| 400 | `{ error: "unknown tier" }` (or a body-parse error) |
+| 401 | `{ error: "unauthorized" }` — no or expired session |
+| 403 | `{ error: "cross-origin request" }` — sent from another origin (see below) |
+| 429 | `{ error: "too_many_checkouts" }` — the account already created 20 checkouts in the last 24 hours |
+| 503 | `{ error: "checkout_not_open" }` / `{ error: "checkout_unavailable" }` — Waffo not configured or not approved / upstream failure |
+
+Every session-cookie POST (`/api/checkout`, `/api/provision`, `/api/claim-code`,
+and the login confirm `POST /auth/callback`) answers
+`403 { error: "cross-origin request" }` when the browser reports another origin:
+a `Sec-Fetch-Site` other than `same-origin`, or an `Origin` that is not this
+host. Customer instances live on `<slug>.<root>`, whose content their owners
+control and which is same-site with the apex, so SameSite=Lax alone would still
+attach the session cookie to their requests.
+
+The session cookie is `__Host-mc_session` (HttpOnly, Secure, SameSite=Lax,
+Path=/, no Domain). A `<slug>.<root>` page can plant cookies with
+`Domain=<root>`; a planted `mc_session` with a longer path would be sent ahead of
+the apex's own cookie. Browsers refuse `Domain` on `__Host-` names, and the
+Worker ignores any session cookie without the prefix.
+
+Login: the magic link opens `GET /auth/callback?t=…`, which only shows which
+email is about to sign in. The page's button sends `POST /auth/callback` with
+`{ t }` from this origin; that request creates the account on first login and
+sets the session cookie. A GET never signs anyone in, so another site cannot
+log a visitor into its own account by linking its magic link.
+
+`GET /api/account` returns the account email, entitlement status, endpoint,
+checkout availability, and the configured payment tiers (only tiers whose Waffo
+product is set, so possibly fewer than three; `checkoutOpen` is false when there
+are none). A live endpoint includes its Cloudflare `tunnelId`. When the account
+has no live endpoint but can get its previous address back, `restorable` is
+`{ slug, hostname }`; otherwise it is null. `GET /api/orders/:id/status`,
+`GET /api/slug/check`, `POST /api/provision`, and `POST /api/claim-code` use the
+same authentication choices. Bearer checkout requests may include an `http:` or
+`https:` `returnUrl` of at most 400 characters without userinfo; cookie checkout
+requests keep the default payment return page.
+
+### Instance link
+
+An instance starts a link with `POST /api/instance-link/start` and receives a
+poll secret and a four-character verification code. Connect emails the account
+owner a confirmation URL. After the owner confirms it, the instance polls
+`POST /api/instance-link/poll` and receives a long-lived `ic_...` credential
+once. It then sends that credential as a bearer token to the authenticated
+account endpoints. `POST /api/instance-link/revoke` revokes it. Each account
+has one active instance credential; linking another instance revokes the older
+credential.
 
 ### Public endpoints (no auth)
 
@@ -112,20 +168,38 @@ sha256. After `token_shown_at` is set, the plaintext is unrecoverable.
 | `TOKEN_WRAP_KEY` | `openssl rand -hex 32` — AES-256-GCM key for token-at-rest |
 | `SESSION_SECRET` | `openssl rand -hex 32` — HMAC key for magic-link + session cookies (P3) |
 | `RESEND_API_KEY` | Resend API key for magic-link emails (P3) |
-| `ALIPAY_APP_ID` | Alipay application ID |
-| `ALIPAY_PRIVATE_KEY` | Merchant RSA2 private key (PKCS#1 or PKCS#8 PEM/bare base64) |
-| `ALIPAY_ALIPAY_PUBLIC_KEY` | Alipay platform public key used to verify responses and notifications |
-| `ALIPAY_SELLER_ID` | Expected Alipay seller/PID; notifications with another seller are rejected |
+| `WAFFO_PRIVATE_KEY` | Waffo private key used by the SDK to sign API calls (PEM) |
 
-Vars (wrangler.jsonc, non-secret): `CONNECT_ROOT_DOMAIN=mediaryconnect.app`.
+Vars (wrangler.jsonc, non-secret): `CONNECT_ROOT_DOMAIN=mediaryconnect.app`, `WAFFO_MERCHANT_ID`, `WAFFO_STORE_ID`, `WAFFO_ENVIRONMENT`, `WAFFO_PRODUCT_QUARTER`, `WAFFO_PRODUCT_YEAR`, and `WAFFO_PRODUCT_TWO_YEARS`.
 
-For a browser sandbox checkout, put the sandbox credentials in the ignored local
-`.dev.vars` and set `ALIPAY_ENVIRONMENT=sandbox`, then run `wrangler dev`. The
-Worker honors sandbox only when the request hostname is `localhost`, `127.0.0.1`,
-or `::1`; a deployed custom domain with that value fails closed. Its signed form
-and CSP are both pinned to the official
-`openapi-sandbox.dl.alipaydev.com` gateway. Production omits the variable (or
-sets `production`) and remains pinned to `openapi.alipay.com`.
+For a local test checkout, put the Waffo test key in the ignored `.dev.vars` and
+set `WAFFO_ENVIRONMENT=test`:
+
+```dotenv
+WAFFO_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...test key...\n-----END PRIVATE KEY-----"
+WAFFO_ENVIRONMENT=test
+```
+
+Run `npx wrangler dev --local-upstream localhost:8787` and expose the Worker
+webhook with **cloudflared**. Wrangler reports the custom-domain route as
+`mediaryconnect.app`; `--local-upstream localhost:8787` makes the local request
+host pass the test-environment guard. Do not use localtunnel: it strips custom
+headers, so `X-Waffo-Signature` never reaches the Worker. ngrok or
+`cloudflared tunnel --url http://localhost:8787` preserve the header.
+
+Register the test webhook for the tunnel URL, then remove it when testing is
+finished:
+
+```ts
+await client.webhooks.add({
+  storeId,
+  channel: "http",
+  url: "<tunnel>/api/waffo/webhook",
+  events: ["order.completed", "refund.succeeded", "refund.failed"],
+  testMode: true,
+});
+await client.webhooks.remove({ id: "<webhook-id>" });
+```
 
 ## Deploy
 
@@ -153,6 +227,8 @@ new shape; deploying first takes the control plane down.
 cd workers/scout-connect
 npx wrangler d1 execute scout-connect --remote \
   --file=./migrations/0001-drop-access-notnull-add-last-seen.sql
+npx wrangler d1 execute scout-connect --remote \
+  --file=./migrations/0007-waffo-payment-orders.sql
 ./scripts/deploy.sh
 ```
 
@@ -160,7 +236,9 @@ npx wrangler d1 execute scout-connect --remote \
 | --- | --- |
 | `0001-drop-access-notnull-add-last-seen.sql` | Drops the `cf_access_app_id NOT NULL` (post-Access `provision.ts` writes `NULL`; the old table rejected it, so **every provision 500'd** after creating and then rolling back the tunnel/DNS). Adds `last_seen_at` for `POST /api/instance/status`. Adds `idx_endpoints_token_sha256` + `idx_waitlist_batch_created` (both paths were full table scans). Realigns `waitlist.status` default `'waiting'` → `'pending'`. |
 | `0002-waitlist-survey.sql` | Adds nullable `waitlist.survey_json TEXT` for `POST /waitlist/survey`. Single additive `ALTER` (no rebuild; pre-existing rows read back NULL). Migrate before deploying. Wrong order no longer takes the funnel down — `insertWaitlist` falls back to the legacy column list and the survey route answers 503 — but degraded means exactly that: signups land without the column and their survey submits fail until this runs. |
-| `0006-alipay-payment-orders.sql` | Adds durable Alipay orders, provider-neutral payment identity, refund tombstones, a durable short-TTL query-coalescing timestamp, and backfills historical payment rows without changing their existing access time. Required before the Alipay-only Worker deploy. |
+| `0006-alipay-payment-orders.sql` | Historical payment order shape. Existing legacy rows remain readable. |
+| `0007-waffo-payment-orders.sql` | Rebuilds `payment_orders` so the `waffo` provider and Waffo session/order evidence are accepted while preserving historical rows and indexes. Required before deploying the Waffo Worker. |
+| `0009-endpoint-revoke-reason.sql` | Adds nullable `endpoints.revoke_reason`. Backfills `refunded` only when `revoked_at` falls within 10 minutes after a refunded order's `refunded_at` for the same account (a refund revoke is that same request: `refunded_at`, then `revokeEndpoint`). A later admin revoke, a revoke before the refund, a `revoke_failed` row (`revoked_at` NULL), and an active row stay NULL and are not self-restorable. Apply before deploying the restore Worker. |
 
 Notes on writing migrations here:
 
@@ -187,18 +265,34 @@ run deploy/secret commands as `env -u CF_API_TOKEN npx wrangler ...`.
 
 ## Operations
 
-**Payment lifecycle**: login → choose one of the fixed tiers → create a local order →
-submit the server-signed form to Alipay. A browser return never proves payment.
-Entitlements are granted only after a verified async notification or signed
-`alipay.trade.query` result matches app ID, seller ID, owned order, amount, and
-paid status. Notification and query races converge through the same durable
-idempotency key. Repeated status requests share a durable 2.5-second query slot;
-`WAIT_BUYER_PAY` is never terminal-cached. Refunds are full amount only and revoke access only when no
-other unrefunded entitlement remains.
+**Payment lifecycle**: login → choose one of the fixed tiers → create a local order
+→ open the Waffo WeChat Pay session. A browser return never proves payment.
+Entitlements are granted only after a verified Waffo webhook or a read-only
+GraphQL payment query matches the owned external order ID, CNY amount, and
+succeeded status. Webhook and query races converge through the same durable
+idempotency key. A full refund removes that order's months and recomputes the
+expiry from the remaining unrefunded entitlements; access is revoked only when
+no paid time remains. Partial refunds are logged and do not remove access.
 
-After deploying, the script performs no-charge production checks. Final launch
-acceptance still requires one real payment by a non-merchant account, automatic
-entitlement fulfillment, and a full refund returned to the original Alipay transaction.
+The WeChat simulator only proves the integration. Production went live on
+2026-10-03 after KYB approval (`prodEnabled`), with all three products
+published and the production webhook registered; a real ¥45 payment and its
+full refund then went through the live webhook and order-query paths. Repeat
+that real payment and refund after changing the payment code.
+
+**Refunds**: issue refunds from the Waffo dashboard (or through the merchant
+API refund ticket). The resulting `refund.succeeded` webhook removes the
+purchased time; when no time remains, the remote endpoint is revoked
+automatically. Partial refunds do not change the entitlement.
+
+**Restoring an address**: taking an address down records why.
+`revoke_reason` is `expired` when the grace period ends, `refunded` when a
+refund removed the last paid time, or `admin` for a manual revoke. After the
+account pays again, `POST /api/provision` with that same slug brings the same
+row back: a new tunnel and DNS record, the slug and hostname unchanged. An
+admin revoke cannot be restored by the owner. Rows revoked before migration
+0009 stay unrestorable unless the backfill marked them `refunded`, and that
+backfill only matches a revoke within 10 minutes after the order's `refunded_at`.
 
 **Invite someone** (admin page `https://mediaryconnect.app/admin`):
 1. Paste `ADMIN_TOKEN`, create invite with their email (+ optional slug).

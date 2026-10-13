@@ -2,9 +2,9 @@
 
 ## 服务条款
 
-Last updated: 2026-08-16
+Last updated: 2026-10-04
 
-最后更新:2026-08-16
+最后更新:2026-10-04
 
 ## What the service is
 
@@ -22,12 +22,12 @@ Mediary Connect 为自托管的 Mediary Scout 实例提供远程访问通道:一
 
 ## 你的责任
 
-- **You must enable the access password.** Your instance is exposed on the public internet via the dedicated hostname; you must enable the access password in your instance settings (it is required on first remote open). Data leaks from an ungated instance are on you.
+- **You must set the access password.** Your instance is exposed on the public internet via the dedicated hostname, and the access password is its only gate. Set it from your home network first (open your instance's LAN address, e.g. `http://192.168.1.10:3000/login`): the first password can only be set on the LAN, and a remote visitor to an instance without one only sees a notice. Data leaks from an ungated instance are on you.
 - **Lawful use.** You are solely responsible for the legality of content you acquire or transmit through your instance. We do not and cannot inspect tunnel traffic.
 - **Slug.** Do not use a name that infringes trademarks, impersonates others, or contains offensive words. Violations may be disabled, and we reserve the slug from reassignment.
 - Do not use the tunnel for anything other than your Mediary Scout instance (the tunnel target is fixed to your instance's web service).
 
-- **必须启用访问密码**:你的实例经专属域名暴露在公网,必须在实例设置中启用访问密码(首次远程打开时会强制要求)。因未设门禁导致的数据泄露由你自行承担。
+- **必须设置访问密码**:你的实例经专属域名暴露在公网,访问密码是它唯一的门禁。请先在家里的局域网设好(打开实例的局域网地址,例如 `http://192.168.1.10:3000/login`):第一次设置只能在局域网里完成,外网打开没设密码的实例只会看到提示。因未设门禁导致的数据泄露由你自行承担。
 - **合法使用**:你通过实例获取与传输的内容,由你对其合法性负全责。本服务不审查也无法审查隧道流量。
 - **域名前缀(slug)**:不得使用侵犯他人商标、冒充他人或含有攻击性词汇的名字。违者我们有权停用并保留该 slug 不再分配。
 - 不得将隧道用于 Mediary Scout 实例之外的用途(隧道指向固定为你实例的 web 服务)。
@@ -37,14 +37,14 @@ Mediary Connect 为自托管的 Mediary Scout 实例提供远程访问通道:一
 ## 付费与时长
 
 - The service is billed as **prepaid time**: you buy several months of access, get an email reminder before expiry, and are **never auto-charged**.
-- After expiry there is a 7-day grace period (service continues); when grace ends, the hostname stops resolving and the tunnel is reclaimed immediately to free capacity. Renewing later restores the same slug — you re-run the one-line setup command once to bring the tunnel back up.
-- Your slug is kept permanently and is never released to others; on renewal you re-run the one-line setup command to bring the tunnel back up with the same address.
-- See the [Refund Policy](https://mediaryconnect.app/refund). Payments are one-time Alipay transactions; no automatic renewal is created.
+- After expiry there is a 7-day grace period (service continues); when grace ends, the hostname stops resolving and the tunnel is reclaimed immediately to free capacity. Renewing later restores the same slug: after paying, click 恢复原地址 (Restore) in the console (or in your instance's Settings → Remote access), then connect once more to bring the tunnel back up.
+- Your slug is kept permanently and is never released to others; after renewing you restore it and connect once more, and the tunnel comes back up with the same address.
+- See the [Refund Policy](https://mediaryconnect.app/refund). Waffo.com Limited is the merchant of record, processes one-time WeChat Pay payments, and sends the receipt. No automatic renewal is created.
 
 - 服务按**预付时长**计费:付费购买若干个月的访问权,到期前会邮件提醒续期,**不会自动扣款**。
-- 到期后有 7 天宽限期(服务照常);宽限期满域名停止解析,并**立即回收隧道**以释放配额。之后续期,slug 原样恢复,需重跑一次一行接入命令让隧道重新上线。
-- 你的 slug 永久保留,永不释放给他人;续期后重跑一次一行接入命令,即可以同一地址恢复。
-- 退款见[退款政策](https://mediaryconnect.app/refund)。付款通过支付宝一次性完成,不会开通自动续费。
+- 到期后有 7 天宽限期(服务照常);宽限期满域名停止解析,并**立即回收隧道**以释放配额。之后续期,slug 原样恢复:付款后在控制台(或实例的「设置 → 远程访问」)点「恢复原地址」,再接入一次让隧道重新上线。
+- 你的 slug 永久保留,永不释放给他人;续期后恢复原地址、再接入一次,即可以同一地址恢复。
+- 退款见[退款政策](https://mediaryconnect.app/refund)。Waffo.com Limited 是记录商户,通过微信支付一次性收款并发送付款凭证,不会开通自动续费。
 
 ## Service level
 
@@ -78,9 +78,9 @@ Term updates are dated on this page; material changes are emailed. Continued use
 
 ## 运营主体
 
-This service is operated and sold by **DF Digital**, a sole proprietorship. Alipay provides the payment channel.
+This service is operated by **DF Digital**, a sole proprietorship. **Waffo.com Limited is the merchant of record** for purchases, handles WeChat Pay, and sends payment receipts.
 
-本服务由 **DF Digital**(个体工商户)运营并销售,支付宝提供支付通道。
+本服务由 **DF Digital**(个体工商户)运营。购买由 **Waffo.com Limited** 作为记录商户处理,通过微信支付收款并发送付款凭证。
 
 ## Governing law
 

@@ -35,10 +35,11 @@ describe("home page(apex 落地页)", () => {
     expect(html).toContain("不能直接下单");
   });
 
-  it("明确全站仅支付宝付款", () => {
+  it("明确全站使用微信支付并由 Waffo 处理", () => {
     const html = homePage();
-    expect(html).toContain("仅支持支付宝");
-    expect(html).not.toContain("微信支付");
+    expect(html).toContain("使用微信支付");
+    expect(html).toContain("Waffo.com Limited");
+    expect(html).not.toMatch(/支付宝|Alipay/);
     expect(html).not.toContain("Paddle");
   });
 
@@ -66,6 +67,27 @@ describe("home page(apex 落地页)", () => {
     // 提示词必须带护栏(学 buildContainerUpgradePrompt)
     expect(html).toContain("立即停止");
     expect(html).toContain("绝不猜");
+  });
+
+  it("部署提示词与现在的装法一致(端口、配置入口、国内镜像、局域网先设密码)", () => {
+    const html = homePage();
+    // compose 默认把 web 映射到宿主 3000(WEB_PORT 可改);3300 只是作者自己实例的改法。
+    expect(html).not.toContain(":3300");
+    expect(html).toContain("默认 3000");
+    // 宿主端口可改:所有宿主地址都用 <端口> 占位,不写死 3000(隧道目标 web:3000 是容器内的,另说)。
+    expect(html).not.toMatch(/localhost:3000|IP&gt;:3000/);
+    // connect.sh 认四种 compose 文件名,提示词不能只认 docker-compose.yml。
+    expect(html).toContain("compose.yaml");
+    // 网盘扫码、AI 模型都在网页设置里配;TMDB 默认走代理,国内填自己的 token 反而容易连不上。
+    expect(html).not.toContain("TMDB_READ_TOKEN");
+    expect(html).toContain("设置页");
+    // Docker Hub 在大陆常年拉不动,首次 up 之前要能设镜像源。
+    expect(html).toContain("DOCKER_MIRROR");
+    // 新装的部署目录可能还没有 .env(connect.sh 会自己建),不能要求它存在。
+    expect(html).not.toContain("docker-compose.yml 和 .env");
+    // 第一次设访问密码只能在局域网里做(外网打开没设密码的实例只有提示)。
+    expect(html).toContain("/login");
+    expect(html).toContain("局域网");
   });
 
   it("接入命令与 connect.sh 的真实用法一致", () => {
@@ -297,12 +319,12 @@ describe("home page(apex 落地页)", () => {
     expect(html).toContain(".apex .btn2{color:var(--tx-1)}");
   });
 
-  it("页脚合规五链接、运营主体与支付宝说明齐全", () => {
+  it("页脚合规五链接、运营主体与 Waffo 说明齐全", () => {
     const html = homePage();
     for (const p of ["/pricing", "/terms", "/privacy", "/refund", "/contact"]) {
       expect(html).toContain(`href="${p}"`);
     }
     expect(html).toContain("DF Digital");
-    expect(html).toContain("付款使用支付宝");
+    expect(html).toContain("Waffo.com Limited 是记录商户");
   });
 });
